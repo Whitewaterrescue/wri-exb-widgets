@@ -100,6 +100,16 @@
     "Site_Type",
     "Site_Rank"
    ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/BNSF_FRPs_2025/FeatureServer/1",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type",
+    "Adjacent_Receiving_Waterbody",
+    "Site_Contact"
+   ]
   }
  ],
  "receptorLayers": [],
