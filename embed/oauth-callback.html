@@ -1,15 +1,28 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Signing in…</title></head>
-<body>
-<script>
-  // ArcGIS Maps SDK OAuth popup callback (standard Esri pattern)
-  if (window.opener && window.opener.require) {
-    window.opener.require(["esri/identity/IdentityManager"], function (esriId) {
-      esriId.setOAuthResponseHash(window.location.hash);
-      window.close();
-    });
-  }
-</script>
-</body>
+  <head>
+    <title>Signing in…</title>
+    <!-- Esri canonical OAuth popup callback (jsapi-resources/oauth) — handles both
+         the legacy implicit flow (token in #hash) and the PKCE code flow (?search). -->
+    <script>
+      function loadHandler() {
+        if (opener) {
+          if (location.hash) {
+            try {
+              var esriId = opener.require("esri/kernel").id;
+            } catch (e) {}
+            if (esriId) {
+              esriId.setOAuthResponseHash(location.hash);
+            } else {
+              opener.dispatchEvent(new CustomEvent("arcgis:auth:hash", { detail: location.hash }));
+            }
+          } else if (location.search) {
+            opener.dispatchEvent(new CustomEvent("arcgis:auth:location:search", { detail: location.search }));
+          }
+        }
+        close();
+      }
+    </script>
+  </head>
+  <body onload="loadHandler();"></body>
 </html>
