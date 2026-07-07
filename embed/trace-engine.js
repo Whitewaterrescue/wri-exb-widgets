@@ -25,6 +25,16 @@ const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
 const NWIS_IV = "https://waterservices.usgs.gov/nwis/iv/";
 const NWIS_SITE = "https://waterservices.usgs.gov/nwis/site/";
 
+/**
+ * NHDPlus MR waterbody flags lag reality — reaches through REMOVED dams still
+ * carry wbareatype LakePond and would false-stop the clock. Known removals
+ * are excluded here (extendable per-run via config.impoundExcludeComids).
+ */
+export const REMOVED_IMPOUNDMENT_COMIDS = new Set([
+  // Milltown Dam, Clark Fork at Bonner MT — removed 2008-2010 (reported by Cody 2026-07-07)
+  24293120, 24293122, 24293124,
+]);
+
 export const DEFAULT_CONFIG = {
   maxDistanceKm: 300,
   maxHours: 24,
@@ -38,6 +48,7 @@ export const DEFAULT_CONFIG = {
   siteProviders: [],
   receptorProviders: [],
   impoundStopKm: 2.0,
+  impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
   asOf: null,                 // 'YYYY-MM-DD' historical Q; null = live
   verbose: true,
 };
@@ -552,9 +563,12 @@ export function computeTrace(data, config = {}) {
   log(`  Manning's depth: ${ok}/${n} points (${Math.round((100 * ok) / n)}%)`);
 
   // 5. impoundment rule: flowline passes through a LakePond/Reservoir waterbody
+  // (minus known REMOVED dams whose waterbody flags linger in NHDPlus)
+  const excluded = new Set([...REMOVED_IMPOUNDMENT_COMIDS, ...(cfg.impoundExcludeComids || [])]);
   let stopIdx = null, runM = 0.0;
   for (let i = 0; i < rows.length; i++) {
-    const imp = rows[i].wbareatype === "LakePond" || rows[i].wbareatype === "Reservoir";
+    const imp = (rows[i].wbareatype === "LakePond" || rows[i].wbareatype === "Reservoir") &&
+      !excluded.has(rows[i].comid);
     rows[i].impounded = imp;
     if (imp) {
       runM += rows[i].distance;
