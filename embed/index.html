@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spill Trajectory</title>
+<link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: flex; height: 100%; }
+  #viewDiv { flex: 1; min-width: 0; }
+  #panel { width: 360px; overflow-y: auto; padding: 10px; box-sizing: border-box;
+           border-left: 1px solid #ddd; background: #fff; }
+  #panel h2 { margin: 0 0 8px; font-size: 15px; color: #cc0000; }
+  .row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  button { padding: 5px 10px; border: 1px solid #bbb; border-radius: 4px; background: #f6f6f6; cursor: pointer; }
+  button.primary { background: #cc0000; border-color: #cc0000; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { min-height: 18px; margin-bottom: 6px; }
+  #diag { color: #888; font-size: 11px; margin-bottom: 8px; }
+  #warnings { display: none; background: #fff3cd; border: 1px solid #ffeeba; padding: 6px;
+              margin-bottom: 8px; border-radius: 4px; }
+  #note { color: #555; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 2px 4px; border-bottom: 1px solid #eee; white-space: nowrap; }
+  td.sitecol { white-space: normal; }
+  thead tr { border-bottom: 1px solid #ccc; }
+  tfoot tr { border-top: 2px solid #ccc; font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 5px; margin-right: 4px; }
+  .dim { color: #999; }
+  #legendNote { color: #777; margin-top: 4px; font-size: 11px; }
+  @media (max-width: 700px) {
+    #app { flex-direction: column; }
+    #panel { width: auto; height: 45%; border-left: none; border-top: 1px solid #ddd; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="viewDiv"></div>
+  <div id="panel">
+    <h2 id="title">Spill Trajectory</h2>
+    <div class="row">
+      <button id="armBtn" class="primary" disabled>Set spill point</button>
+      <button id="clearBtn">Clear</button>
+      <label style="margin-left:auto" title="Safety factor — changing it re-runs instantly from cached hydrology">
+        SF <select id="sfSel">
+          <option value="1.0">1.0</option><option value="1.25">1.25</option>
+          <option value="1.5" selected>1.5</option><option value="2.0">2.0</option>
+        </select>
+      </label>
+    </div>
+    <div id="status">Loading…</div>
+    <div id="diag"></div>
+    <div id="warnings"></div>
+    <div id="note"></div>
+    <div id="results"></div>
+    <div id="legendNote"></div>
+  </div>
+</div>
+
+<script src="https://js.arcgis.com/4.30/"></script>
+<script>
+(async function () {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+
+  // ---- config ----
+  const cfgParam = params.get("config") || "all-grps";
+  const cfgUrl = /^https?:/.test(cfgParam) ? cfgParam : `../configs/${cfgParam}.json`;
+  let CFG;
+  try {
+    CFG = await (await fetch(cfgUrl)).json();
+  } catch (e) {
+    $("status").textContent = `Config load failed (${cfgUrl}): ${e}`;
+    return;
+  }
+  if (params.get("webmap")) CFG.webmap = params.get("webmap");
+  if (CFG.title) { $("title").textContent = CFG.title; document.title = CFG.title; }
+  $("sfSel").value = String(CFG.safetyFactor ?? 1.5);
+
+  const APP_ID = params.get("appid") || "ZTWroggX3c8hdiJo"; // WRI Web Deliverables (GitHub Pages)
+
+  const engine = await import("./trace-engine.js");
+
+  require([
+    "esri/WebMap", "esri/Map", "esri/views/MapView",
+    "esri/layers/GraphicsLayer", "esri/layers/FeatureLayer", "esri/Graphic",
+    "esri/geometry/Polyline", "esri/geometry/Point", "esri/geometry/geometryEngine",
+    "esri/identity/OAuthInfo", "esri/identity/IdentityManager",
+  ], function (WebMap, Map, MapView, GraphicsLayer, FeatureLayer, Graphic,
+               Polyline, Point, geometryEngine, OAuthInfo, esriId) {
+
+    esriId.registerOAuthInfos([new OAuthInfo({
+      appId: APP_ID, popup: true,
+      popupCallbackUrl: "oauth-callback.html", flowType: "auto",
+    })]);
+
+    const map = CFG.webmap
+      ? new WebMap({ portalItem: { id: CFG.webmap } })
+      : new Map({ basemap: "hybrid" });
+    const view = new MapView({
+      container: "viewDiv", map,
+      center: CFG.center || [-112.5, 45.5], zoom: CFG.zoom || 5,
+    });
+    const gfx = new GraphicsLayer({ title: "Spill trajectory (ephemeral)", listMode: "hide" });
+    view.when(() => {
+      map.add(gfx);
+      $("armBtn").disabled = false;
+      $("status").textContent = 'Click "Set spill point", then click the river.';
+    });
+
+    // ---- ETA color bands ----
+    const bandColor = (hr) => (hr < 3 ? "#d7191c" : hr < 12 ? "#fdae61" : "#2c7bb6");
+
+    // ---- providers (ports of the ExB widget's) ----
+    const makeSiteProvider = (lc, defBuf, label, notes) => ({
+      buffer_m: lc.bufferM ?? defBuf,
+      fetch: async () => {
+        try {
+          const fl = new FeatureLayer({ url: lc.url });
+          const q = fl.createQuery();
+          q.where = lc.where || "1=1";
+          q.outFields = [lc.nameField, ...(lc.extraFields || [])];
+          q.returnGeometry = true;
+          q.outSpatialReference = { wkid: 4326 };
+          const fs = await fl.queryFeatures(q);
+          const rows = fs.features
+            .filter((f) => f.geometry && f.geometry.type === "point")
+            .map((f) => {
+              const row = { name: f.attributes[lc.nameField], lat: f.geometry.y, lon: f.geometry.x };
+              for (const ef of lc.extraFields || []) row[ef] = f.attributes[ef];
+              return row;
+            });
+          notes.push(`${label}: ${rows.length} point features loaded (buffer ${lc.bufferM ?? defBuf} m)`);
+          return rows;
+        } catch (e) {
+          notes.push(`${label} FAILED: ${String(e).slice(0, 100)}`);
+          return [];
+        }
+      },
+    });
+
+    const makeWidthProvider = () => {
+      const wl = CFG.widthLayer;
+      if (!wl || !wl.url) return null;
+      const fl = new FeatureLayer({ url: wl.url });
+      return async (env) => {
+        const q = fl.createQuery();
+        q.where = wl.where || "1=1";
+        q.geometry = { type: "extent", ...env, spatialReference: { wkid: 4326 } };
+        q.spatialRelationship = "intersects";
+        q.outFields = [wl.widthField];
+        q.returnGeometry = true;
+        q.outSpatialReference = { wkid: 4326 };
+        const fs = await fl.queryFeatures(q);
+        const mids = [];
+        for (const f of fs.features) {
+          const g = f.geometry;
+          if (g && g.paths && g.paths.length) {
+            const p = g.paths[0], m = p[Math.floor(p.length / 2)];
+            mids.push({ lat: m[1], lon: m[0], width: f.attributes[wl.widthField] || 0 });
+          }
+        }
+        return mids;
+      };
+    };
+
+    const normGuid = (v) => String(v || "").replace(/[{}]/g, "").toLowerCase();
+    async function fetchDrawnBoom(bc) {
+      const fl = new FeatureLayer({ url: bc.url });
+      const q = fl.createQuery();
+      q.where = bc.where || "1=1";
+      q.outFields = [bc.siteKeyField];
+      q.returnGeometry = true;
+      q.outSpatialReference = { wkid: 4326 };
+      const fs = await fl.queryFeatures(q);
+      const out = new Map();
+      for (const f of fs.features) {
+        const key = normGuid(f.attributes[bc.siteKeyField]);
+        if (!key || !f.geometry) continue;
+        const ft = geometryEngine.geodesicLength(f.geometry, "feet");
+        if (ft > 0) out.set(key, (out.get(key) || 0) + ft);
+      }
+      return out;
+    }
+
+    const applyEquipment = (res, drawn) => {
+      const eq = CFG.equipment;
+      if (eq && eq.enabled === false) return;
+      const rules = {
+        entrainmentMs: (eq && eq.entrainmentMs) ?? 0.35,
+        anchorSpacingFt: (eq && eq.anchorSpacingFt) ?? 100,
+        reservePct: (eq && eq.reservePct) ?? 20,
+      };
+      for (const s of res.sites) {
+        const key = normGuid(s.GlobalID ?? s.globalid ?? s.GLOBALID);
+        const drawnFt = key ? drawn.get(key) : undefined;
+        if (drawnFt) {
+          const boomFt = Math.ceil(drawnFt / 50) * 50;
+          s.boom = { boom_ft: boomFt, anchors: Math.max(2, Math.ceil(boomFt / rules.anchorSpacingFt) + 1), source: "drawn" };
+        } else {
+          const est = engine.estimateBoomNeeds(s.river_width_m, s.velocity_ms, rules);
+          if (est) s.boom = Object.assign({}, est, { source: "est" });
+        }
+      }
+    };
+
+    // ---- drawing ----
+    function draw(res, spill) {
+      gfx.removeAll();
+      gfx.add(new Graphic({
+        geometry: new Point({ latitude: spill.lat, longitude: spill.lon }),
+        symbol: { type: "simple-marker", style: "x", size: 14, outline: { color: "#000", width: 3 } },
+        popupTemplate: { title: "Spill point", content: `${spill.lat.toFixed(5)}, ${spill.lon.toFixed(5)}` },
+      }));
+      const rows = res.trace;
+      let b0 = 0;
+      for (let i = 1; i <= rows.length; i++) {
+        const done = i === rows.length;
+        const changed = !done && bandColor(rows[i].cum_time) !== bandColor(rows[b0].cum_time);
+        if (done || changed) {
+          const seg = rows.slice(b0, Math.min(i + 1, rows.length));
+          gfx.add(new Graphic({
+            geometry: new Polyline({ paths: [seg.map((r) => [r.lon, r.lat])], spatialReference: { wkid: 4326 } }),
+            symbol: { type: "simple-line", color: bandColor(rows[b0].cum_time), width: 4 },
+          }));
+          b0 = i;
+        }
+      }
+      for (const h of res.hourly) {
+        gfx.add(new Graphic({
+          geometry: new Point({ latitude: h.lat, longitude: h.lon }),
+          symbol: { type: "simple-marker", size: 7, color: bandColor(h.hour), outline: { color: "#fff", width: 1 } },
+          popupTemplate: { title: `Hour ${h.hour}`, content: `${h.cum_dist_km.toFixed(1)} km downstream · ${h.velocity_mph.toFixed(1)} mph` },
+        }));
+        gfx.add(new Graphic({
+          geometry: new Point({ latitude: h.lat, longitude: h.lon }),
+          symbol: { type: "text", text: `${h.hour} hr`, color: bandColor(h.hour),
+                    haloColor: "#ffffff", haloSize: 1.5, yoffset: 9,
+                    font: { size: 10, weight: "bold", family: "sans-serif" } },
+        }));
+      }
+    }
+
+    // ---- results panel ----
+    function renderResults(res) {
+      const sites = res.sites || [];
+      const w = $("warnings");
+      if (res.warnings && res.warnings.length) {
+        w.style.display = "block";
+        w.innerHTML = res.warnings.map((x) => `<div>&#9888; ${x}</div>`).join("");
+      } else { w.style.display = "none"; }
+      $("note").textContent = sites.length
+        ? `ETAs are estimates (±20%), safety factor ×${res.safety_factor} applied — treat as bands, not appointments. ` +
+          (res.gauges_used.length ? `Flows: ${res.gauges_used.map((g) => g.station_id).join(", ")}.` : "No live gauges — drainage-area flow estimate.")
+        : "";
+      if (!sites.length) {
+        $("results").innerHTML = '<div class="dim">No configured sites within reach of this trace.</div>';
+        $("legendNote").textContent = "";
+        return;
+      }
+      const fmtEta = (h) => (h < 1 ? `${Math.round(h * 60)} min` : `${h.toFixed(1)} hr`);
+      let html = "<table><thead><tr><th>ETA</th><th>Site</th><th>km</th><th>Boom</th></tr></thead><tbody>";
+      let totFt = 0, totAn = 0, nBoom = 0;
+      for (const s of sites) {
+        let boomCell = "—";
+        if (s.boom) {
+          nBoom++; totFt += s.boom.boom_ft; totAn += s.boom.anchors;
+          const tip = `${s.boom.anchors} anchor sets` +
+            (s.boom.boom_angle_deg ? ` · ${s.boom.boom_angle_deg}° deployment` : "") +
+            (s.boom.cascade_advised ? " · fast water: cascade multiple booms" : "") +
+            ` (${s.boom.source === "drawn" ? "from drawn boom lines" : "estimated from modeled width/velocity"})`;
+          boomCell = `<span title="${tip}">${s.boom.boom_ft.toLocaleString()} ft${s.boom.cascade_advised ? " &#9889;" : ""}` +
+            ` <span class="dim">${s.boom.source === "drawn" ? "&#10003;" : "est."}</span></span>`;
+        }
+        html += `<tr><td><span class="dot" style="background:${bandColor(s.eta_hr)}"></span>${fmtEta(s.eta_hr)}</td>` +
+                `<td class="sitecol">${s.name ?? ""}</td><td>${s.dist_km.toFixed(1)}</td><td>${boomCell}</td></tr>`;
+      }
+      html += "</tbody>";
+      if (nBoom) {
+        html += `<tfoot><tr><td colspan="3">Totals (${nBoom} boom sites)</td>` +
+                `<td>${totFt.toLocaleString()} ft · ${totAn} anchors</td></tr></tfoot>`;
+      }
+      html += "</table>";
+      $("results").innerHTML = html;
+      $("legendNote").textContent = nBoom
+        ? `✓ = drawn boom lines · est. = sized from modeled width/velocity (normal flow ≤ ${(CFG.equipment && CFG.equipment.entrainmentMs) ?? 0.35} m/s, +${(CFG.equipment && CFG.equipment.reservePct) ?? 20}% reserve) · ⚡ = fast water, cascade booms`
+        : "";
+    }
+
+    // ---- run flow with cached hydrology ----
+    let cache = null;   // { lat, lon, data, drawn, fetchNotes }
+    let clickHandle = null, running = false;
+
+    const modelCfg = (sf) => ({
+      safetyFactor: sf,
+      minStreamOrder: CFG.minStreamOrder ?? 4,
+      maxHours: CFG.maxHours ?? 24,
+      maxDistanceKm: CFG.maxDistanceKm ?? 300,
+      verbose: false,
+    });
+
+    function computeAndRender(sf, fromCache) {
+      if (!cache) return;
+      const res = engine.computeTrace(cache.data, modelCfg(sf));
+      applyEquipment(res, cache.drawn);
+      draw(res, cache);
+      renderResults(res);
+      $("diag").innerHTML = cache.fetchNotes.concat([`${res.sites.length} site(s) within buffer of the trace.`])
+        .map((d) => `<div>${d}</div>`).join("");
+      $("status").textContent =
+        `${res.river_name || "Trace"} — ${res.distance_km_24h.toFixed(1)} km in ≤ ${CFG.maxHours ?? 24} h` +
+        (fromCache ? " · recomputed instantly from cached hydrology" : "");
+    }
+
+    $("armBtn").onclick = () => {
+      if (running || clickHandle) return;
+      $("status").textContent = "Click the spill location on the map…";
+      $("armBtn").textContent = "Click the map…";
+      clickHandle = view.on("click", async (evt) => {
+        clickHandle.remove(); clickHandle = null;
+        $("armBtn").textContent = "Set spill point";
+        const lat = evt.mapPoint.latitude, lon = evt.mapPoint.longitude;
+        running = true;
+        $("armBtn").disabled = true;
+        $("results").innerHTML = ""; $("warnings").style.display = "none"; $("note").textContent = "";
+        $("diag").innerHTML = "";
+        $("status").textContent = `Tracing from ${lat.toFixed(4)}, ${lon.toFixed(4)}…`;
+        const notes = [];
+        try {
+          const siteLayers = CFG.siteLayers || [];
+          if (!siteLayers.length) notes.push("No site layers configured in this page's config.");
+          const data = await engine.fetchTraceData(lat, lon, Object.assign(modelCfg(parseFloat($("sfSel").value)), {
+            widthProvider: makeWidthProvider(),
+            siteProviders: siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
+            receptorProviders: (CFG.receptorLayers || []).map((lc, i) => makeSiteProvider(lc, 800, `Receptor layer ${i + 1}`, notes)),
+          }));
+          const drawn = new Map();
+          const seen = new Set();
+          const boomCfgs = siteLayers.filter((lc) => lc.boomLayer && lc.boomLayer.url).map((lc) => lc.boomLayer);
+          if (CFG.equipment && CFG.equipment.boomLayer && CFG.equipment.boomLayer.url) boomCfgs.push(CFG.equipment.boomLayer);
+          for (const bc of boomCfgs) {
+            const sig = `${bc.url}|${bc.siteKeyField}`;
+            if (seen.has(sig)) continue;
+            seen.add(sig);
+            try {
+              const m = await fetchDrawnBoom(bc);
+              m.forEach((v, k) => drawn.set(k, (drawn.get(k) || 0) + v));
+              notes.push(`Boom lines: drawn footage for ${m.size} site(s)`);
+            } catch (e) { notes.push(`Boom layer FAILED: ${String(e).slice(0, 90)}`); }
+          }
+          cache = { lat, lon, data, drawn, fetchNotes: notes.slice() };
+          computeAndRender(parseFloat($("sfSel").value), false);
+        } catch (e) {
+          $("status").textContent = `Trace failed: ${String(e).slice(0, 140)}`;
+          $("diag").innerHTML = notes.map((d) => `<div>${d}</div>`).join("");
+        } finally {
+          running = false;
+          $("armBtn").disabled = false;
+        }
+      });
+    };
+
+    $("clearBtn").onclick = () => {
+      if (clickHandle) { clickHandle.remove(); clickHandle = null; $("armBtn").textContent = "Set spill point"; }
+      gfx.removeAll();
+      cache = null;
+      $("results").innerHTML = ""; $("warnings").style.display = "none";
+      $("note").textContent = ""; $("diag").innerHTML = ""; $("legendNote").textContent = "";
+      $("status").textContent = 'Cleared. Click "Set spill point" to run again.';
+    };
+
+    $("sfSel").onchange = () => { if (cache && !running) computeAndRender(parseFloat($("sfSel").value), true); };
+  });
+})();
+</script>
+</body>
+</html>
