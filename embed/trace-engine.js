@@ -20,6 +20,8 @@
  *   6. snap click to streamorde >= minStreamOrder
  */
 
+export const ENGINE_VERSION = "1.2.0";
+
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
 const NWIS_IV = "https://waterservices.usgs.gov/nwis/iv/";
@@ -49,6 +51,7 @@ export const DEFAULT_CONFIG = {
   receptorProviders: [],
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
+  timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
   asOf: null,                 // 'YYYY-MM-DD' historical Q; null = live
   verbose: true,
 };
@@ -244,6 +247,12 @@ async function vaaBatch(comids) {
     });
     for (const f of j.features || []) {
       const p = f.properties;
+      // EROM monthly modeled flow (gauge-adjusted, cfs) — ungauged fallback + Jobson Qa
+      const qe = {};
+      for (let m = 1; m <= 12; m++) {
+        const k = `qe_${String(m).padStart(2, "0")}`;
+        qe[m] = p[k] ?? null;
+      }
       out.set(Number(p.comid), {
         hydroseq: p.hydroseq ?? null,
         streamorde: p.streamorde ?? null,
@@ -254,7 +263,11 @@ async function vaaBatch(comids) {
         gnis_name: p.gnis_name ?? null,
         // LakePond/Reservoir = impounded; StreamRiver = braided free-flowing
         wbareatype: p.wbareatype ?? null,
-        ve_ma: p.ve_ma ?? null, // EROM velocity — future no-gauge fallback
+        ve_ma: p.ve_ma ?? null,
+        qe_ma: p.qe_ma ?? null,   // EROM mean annual flow (cfs) — Jobson Qa
+        qe_monthly: qe,
+        // NHDPlus divergence: 0 = none, 1 = main path, 2 = minor path of a split
+        divergence: p.divergence ?? 0,
       });
     }
   }
@@ -361,6 +374,8 @@ function assembleTrace(lat, lon, geoms, vaa, resolutionM, log) {
         ftype: s.ftype, wbareatype: s.wbareatype,
         comid: s.comid,
         gnis_name: s.gnis_name,
+        qe_ma: s.qe_ma, qe_monthly: s.qe_monthly,
+        divergence: s.divergence || 0,
       });
     }
   }
@@ -435,6 +450,21 @@ export async function fetchTraceData(lat, lon, config = {}) {
     r.formula_width = estimateGeometryPayton(r.drainage_area_sqmi)[0];
     r.width_m = 0.0;
   }
+  // braided-reach flag: any NHDPlus divergence within ~1 km (10 rows) — GLOW widths
+  // there measure total wetted width across bars, inflating A and killing velocity
+  {
+    const W = 10;
+    for (let i = 0; i < n; i++) {
+      let braided = false;
+      for (let k = Math.max(0, i - W); k <= Math.min(n - 1, i + W); k++) {
+        if (rows[k].divergence > 0) { braided = true; break; }
+      }
+      rows[i].braided = braided;
+    }
+    const nb = rows.filter((r) => r.braided).length;
+    if (nb) log(`  braided flag: ${nb}/${n} trace points near channel divergences (GLOW override disabled there)`);
+  }
+
   if (cfg.widthProvider) {
     // HR NHDPlusID != MR comid — sample spatially, in windows; never let the
     // override kill the run (degrade to formula widths).
@@ -459,6 +489,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     }
     if (mids.length) {
       for (const r of rows) {
+        if (r.braided) { r.width_m = 0.0; continue; } // formula width on braided reaches
         let bestD = Infinity, bestW = 0;
         for (const m of mids) {
           const d = haversineM(r.lat, r.lon, m.lat, m.lon);
@@ -521,10 +552,44 @@ export async function fetchTraceData(lat, lon, config = {}) {
   );
 
   return {
-    lat, lon, comid, snapName, riverName,
+    lat, lon, comid, snapName, snapDistM: snapD, riverName,
     rows, gd, siteSets, receptorSets,
     asOf: cfg.asOf || "live",
+    fetchedAt: new Date().toISOString(),
   };
+}
+
+// ---------------------------------------------------------------- Jobson (USGS WRIR 96-4013)
+//
+// Dye-tracer regressions from ~980 subreaches / ~90 US rivers. Units: Da m^2,
+// Q & Qa m^3/s, S dimensionless, velocities m/s. Eq 12/13 (with slope) or
+// 14/15 (without). Leading edge Tl = 0.890 x Tp (eq 18). Passage: unit-peak
+// concentration Cup = 857 x Tp^-0.760 x Q'a^-0.079 (Tp hours, eq 7), and
+// Td10 = 2e6 / Cup seconds (eq 19) = leading edge -> 10%-of-peak trailing.
+export function jobsonVelocities(daM2, Qm3s, QaM3s, slope) {
+  if (!(daM2 > 0) || !(Qm3s > 0) || !(QaM3s > 0)) return null;
+  const g = 9.8;
+  const Dp = (Math.pow(daM2, 1.25) * Math.sqrt(g)) / QaM3s; // D'a, eq 10
+  const Qp = Qm3s / QaM3s;                                   // Q'a, eq 11
+  const qOverDa = Qm3s / daM2;
+  let vp, vmp;
+  if (slope > 0.00001) {
+    const X = Math.pow(Dp, 0.919) * Math.pow(Qp, -0.469) * Math.pow(slope, 0.159) * qOverDa;
+    vp = 0.094 + 0.0143 * X;   // eq 12
+    vmp = 0.25 + 0.02 * X;     // eq 13 (99% envelope — fastest probable)
+  } else {
+    const X = Math.pow(Dp, 0.821) * Math.pow(Qp, -0.465) * qOverDa;
+    vp = 0.020 + 0.051 * X;    // eq 14
+    vmp = 0.2 + 0.093 * X;     // eq 15
+  }
+  return { vp, vmp, qPrime: Qp };
+}
+
+export function jobsonPassageHours(tpHours, qPrime) {
+  // eq 7 + eq 19: duration from leading edge to 10%-of-peak trailing edge
+  if (!(tpHours > 0) || !(qPrime > 0)) return null;
+  const cup = 857 * Math.pow(tpHours, -0.760) * Math.pow(qPrime, -0.079); // s^-1
+  return 2e6 / cup / 3600;
 }
 
 export function computeTrace(data, config = {}) {
@@ -534,18 +599,39 @@ export function computeTrace(data, config = {}) {
   const n = rows.length;
 
   // 5. discharge: interpolate along trace
+  // month for EROM lookups: as_of month if pinned, else current
+  const eromMonth = data.asOf && data.asOf !== "live"
+    ? parseInt(data.asOf.slice(5, 7), 10)
+    : new Date().getMonth() + 1;
+
+  let qMethod, qConfidence;
   if (gd.length >= 2) {
     const fQ = interpClamped(gd.map((g) => g.trace_dist), gd.map((g) => g.discharge));
     for (const r of rows) r.Q_cfs = Math.max(fQ(r.cum_dist), 1.0);
+    qMethod = "gauge-interpolation"; qConfidence = "HIGH";
   } else if (gd.length === 1) {
     const g = gd[0];
     for (const r of rows) {
       r.Q_cfs = Math.max(g.discharge * (r.drainage_area_sqmi / g.drainage_area), 1.0);
     }
+    qMethod = "single-gauge-DA-ratio"; qConfidence = "MEDIUM";
     log("  1 gauge: scaling by drainage-area ratio");
   } else {
-    for (const r of rows) r.Q_cfs = r.drainage_area_sqmi * 2.0;
-    log("  NO gauges with data: Q ~ 2 cfs per sq mi drainage");
+    // EROM per-reach monthly modeled flow (gauge-adjusted; captures seasonal
+    // yield — Montana June vs September differs ~5x) before the flat constant
+    const eromOk = rows.filter((r) => r.qe_monthly && r.qe_monthly[eromMonth] > 0).length;
+    if (eromOk >= rows.length * 0.8) {
+      for (const r of rows) {
+        const qe = r.qe_monthly ? r.qe_monthly[eromMonth] : null;
+        r.Q_cfs = Math.max(qe > 0 ? qe : r.drainage_area_sqmi * 2.0, 1.0);
+      }
+      qMethod = `erom-monthly (month ${eromMonth})`; qConfidence = "MODERATE — modeled flow, no live gauge";
+      log(`  NO gauges: EROM monthly modeled flow (month ${eromMonth}, ${eromOk}/${rows.length} reaches)`);
+    } else {
+      for (const r of rows) r.Q_cfs = Math.max(r.drainage_area_sqmi * 2.0, 1.0);
+      qMethod = "drainage-area-constant"; qConfidence = "LOW CONFIDENCE — NO GAUGE";
+      log("  NO gauges, no EROM: Q ~ 2 cfs per sq mi drainage — LOW CONFIDENCE");
+    }
   }
 
   // 4. Manning's depth per point (formula fallback), V = Q/A, safety factor
@@ -588,28 +674,61 @@ export function computeTrace(data, config = {}) {
   }
 
   // 6. travel time, cutoff, hourly markers
-  let cumT = 0.0;
+  const jobson = cfg.timingModel === "jobson";
+  const CFS = Math.pow(3.281, 3);
+  let cumT = 0.0, tPeak = 0.0, tFast = 0.0, jobsonDegraded = 0;
   for (const r of df) {
     r.seg_time = r.distance / r.velocity;
     cumT += r.seg_time;
-    r.cum_time = cumT / 3600;
+    r.cum_time = cumT / 3600; // hydraulic (x safety) — always computed; feeds legacy mode
+    if (jobson) {
+      const daM2 = (r.drainage_area_km2 || 0) * 1e6;
+      const QaM3s = r.qe_ma > 0 ? r.qe_ma / CFS : null;
+      const jv = QaM3s ? jobsonVelocities(daM2, r.Q_m3s, QaM3s, r.slope) : null;
+      let vp, vmp, qPrime;
+      if (jv) { ({ vp, vmp, qPrime } = jv); }
+      else { vp = r.velocity / cfg.safetyFactor; vmp = vp * 2; qPrime = 1; jobsonDegraded++; }
+      tPeak += r.distance / vp;
+      tFast += r.distance / vmp;
+      r.t_peak = tPeak / 3600;
+      r.t_lead = 0.890 * r.t_peak;              // eq 18 — most probable first arrival
+      r.t_lead_min = 0.890 * (tFast / 3600);    // 99% envelope — earliest credible arrival
+      const td10 = jobsonPassageHours(r.t_peak, qPrime);
+      r.t_clear = td10 !== null ? r.t_lead + td10 : null; // 10%-of-peak trailing edge
+    }
   }
-  df = df.filter((r) => r.cum_time < cfg.maxHours);
-  const maxCumTime = df.length ? df[df.length - 1].cum_time : 0;
+  if (jobson && jobsonDegraded) log(`  Jobson: ${jobsonDegraded} points lacked EROM Qa (hydraulic fallback)`);
+  const timeOf = (r) => (jobson ? r.t_lead : r.cum_time);
+  df = df.filter((r) => timeOf(r) < cfg.maxHours);
+  const maxCumTime = df.length ? timeOf(df[df.length - 1]) : 0;
+  const nearestRow = (field, target) => {
+    let bestD = Infinity, i = 0;
+    for (let k = 0; k < df.length; k++) {
+      const d = Math.abs(df[k][field] - target);
+      if (d < bestD) { bestD = d; i = k; } // first occurrence of min (pandas idxmin)
+    }
+    return i;
+  };
   const hourly = [];
   for (let hour = 1; hour <= cfg.maxHours; hour++) {
     if (maxCumTime < hour && Math.abs(maxCumTime - hour) > 0.5) break;
-    let bestD = Infinity, i = 0;
-    for (let k = 0; k < df.length; k++) {
-      const d = Math.abs(df[k].cum_time - hour);
-      if (d < bestD) { bestD = d; i = k; } // first occurrence of min (pandas idxmin)
-    }
-    hourly.push({
+    const i = nearestRow(jobson ? "t_lead" : "cum_time", hour);
+    const h = {
       hour,
       lat: df[i].lat, lon: df[i].lon,
       cum_dist_km: df[i].cum_dist / 1000,
       velocity_mph: df[i].velocity * 2.23694,
-    });
+    };
+    if (jobson) {
+      // band at this hour: bulk (peak) position .. farthest credible (99% leading)
+      const iPeak = nearestRow("t_peak", hour);
+      const iFar = nearestRow("t_lead_min", hour);
+      h.band = {
+        peak: { i: iPeak, lat: df[iPeak].lat, lon: df[iPeak].lon, cum_dist_km: df[iPeak].cum_dist / 1000 },
+        fastest: { i: iFar, lat: df[iFar].lat, lon: df[iFar].lon, cum_dist_km: df[iFar].cum_dist / 1000 },
+      };
+    }
+    hourly.push(h);
   }
 
   // 7. site ETAs + receptor warnings (nearest trace point within buffer);
@@ -627,16 +746,22 @@ export function computeTrace(data, config = {}) {
       }
       if (bestD <= buf) {
         const { lat: _a, lon: _b, ...rest } = f;
-        out.push({
+        const row = {
           ...rest,
-          eta_hr: Math.round(df[i].cum_time * 100) / 100,
+          eta_hr: Math.round(timeOf(df[i]) * 100) / 100,
           dist_km: Math.round((df[i].cum_dist / 1000) * 10) / 10,
           offset_m: Math.round(bestD),
           // modeled hydraulics at the site's trace point — feeds boom sizing
           river_width_m: Math.round(df[i].width_final * 10) / 10,
           velocity_ms: Math.round(df[i].velocity * 1000) / 1000,
           depth_m: Math.round(df[i].depth * 100) / 100,
-        });
+        };
+        if (jobson) {
+          row.eta_early_hr = Math.round(df[i].t_lead_min * 100) / 100;
+          row.eta_peak_hr = Math.round(df[i].t_peak * 100) / 100;
+          row.clear_hr = df[i].t_clear !== null ? Math.round(df[i].t_clear * 100) / 100 : null;
+        }
+        out.push(row);
       }
     }
     out.sort((a, b) => a.eta_hr - b.eta_hr);
@@ -647,6 +772,7 @@ export function computeTrace(data, config = {}) {
   for (const s of siteSets || []) sites.push(...proximity(s));
   sites.sort((a, b) => a.eta_hr - b.eta_hr);
   const warnings = impoundNote ? [impoundNote] : [];
+  if (qConfidence !== "HIGH") warnings.unshift(`Flow estimate: ${qConfidence} (${qMethod})`);
   for (const s of receptorSets || []) {
     for (const r of proximity(s)) {
       warnings.push(
@@ -657,11 +783,38 @@ export function computeTrace(data, config = {}) {
 
   const distanceKm = df.length ? df[df.length - 1].cum_dist / 1000 : 0;
   const avgVel = df.length ? df.reduce((s, r) => s + r.velocity, 0) / df.length : 0;
+  const glowMatched = rows.filter((r) => r.width_m > 0).length;
+  const braidedN = rows.filter((r) => r.braided).length;
+
+  // provenance — enough to reconstruct any output in an after-action review
+  const runRecord = {
+    engine_version: ENGINE_VERSION,
+    generated_at: new Date().toISOString(),
+    data_fetched_at: data.fetchedAt || null,
+    spill_point: { lat: data.lat, lon: data.lon },
+    snap: { comid, river: riverName, snapped_from_m: data.snapDistM !== undefined ? Math.round(data.snapDistM || 0) : null },
+    timing_model: cfg.timingModel,
+    safety_factor: cfg.safetyFactor,
+    max_hours: cfg.maxHours,
+    as_of: data.asOf || "live",
+    q_method: qMethod,
+    q_confidence: qConfidence,
+    gauges: gd.map((g) => ({ station_id: g.station_id, name: g.name, discharge_cfs: g.discharge, trace_km: Math.round(g.trace_dist / 100) / 10 })),
+    erom_month: qMethod.startsWith("erom") ? eromMonth : null,
+    width_source: { glow_matched_points: glowMatched, total_points: rows.length, braided_points_formula_width: braidedN },
+    jobson_degraded_points: jobson ? jobsonDegraded : null,
+    impound_exclusions_applied: [...excluded].filter((c) => rows.some((r) => r.comid === c)),
+    impound_stop_km: stopIdx !== null ? Math.round(rows[stopIdx].cum_dist / 100) / 10 : null,
+  };
+
   const result = {
     river_name: riverName,
     comid,
     as_of: data.asOf || "live",
     safety_factor: cfg.safetyFactor,
+    timing_model: cfg.timingModel,
+    q_method: qMethod,
+    q_confidence: qConfidence,
     gauges_used: gd.map((g) => ({
       station_id: g.station_id, name: g.name,
       discharge: g.discharge, trace_dist: g.trace_dist,
@@ -672,6 +825,7 @@ export function computeTrace(data, config = {}) {
     hourly,
     sites,
     warnings,
+    runRecord,
     trace: df, // full row array for inspection/geojson export
   };
   log(

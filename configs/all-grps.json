@@ -1,36 +1,113 @@
 {
-  "title": "WRI GRPs — Spill Trajectory",
-  "center": [-112.5, 45.5],
-  "zoom": 5,
-  "safetyFactor": 1.5,
-  "minStreamOrder": 4,
-  "maxHours": 24,
-  "maxDistanceKm": 300,
-  "siteLayers": [
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/1",
-     "nameField": "site_name", "bufferM": 500, "where": "status <> 'rejected'",
-     "extraFields": ["river_mile", "strategy_type", "GlobalID"],
-     "boomLayer": {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/0",
-                   "siteKeyField": "site_globalid"}},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Clarkfork_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type", "Site_Rank"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Missouri_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Location_Description", "bufferM": 500, "extraFields": ["Site_Type", "Site_Rank"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Colorado_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Yellowstone_River_GRP_Points_2025_5/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type", "Site_Rank"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Lochsa_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Location_Description", "bufferM": 500, "extraFields": ["Site_Type"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Kootenai_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Kootenai_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Location_Description", "bufferM": 500, "extraFields": ["Site_Type"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/MF_Flathead_GRP_Points_2025_WFL1/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type"]},
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Jocko_River_GRP_Points_2025/FeatureServer/0",
-     "nameField": "Site_Name", "bufferM": 500, "extraFields": ["Site_Type", "Site_Rank"]}
-  ],
-  "receptorLayers": [],
-  "equipment": {"enabled": true, "entrainmentMs": 0.35, "anchorSpacingFt": 100, "reservePct": 20}
+ "title": "WRI GRPs \u2014 Spill Trajectory",
+ "center": [
+  -112.5,
+  45.5
+ ],
+ "zoom": 5,
+ "safetyFactor": 1.5,
+ "minStreamOrder": 4,
+ "maxHours": 24,
+ "maxDistanceKm": 300,
+ "siteLayers": [
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/1",
+   "nameField": "site_name",
+   "bufferM": 500,
+   "where": "status <> 'rejected'",
+   "extraFields": [
+    "river_mile",
+    "strategy_type",
+    "GlobalID"
+   ],
+   "boomLayer": {
+    "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/0",
+    "siteKeyField": "site_globalid"
+   }
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Clarkfork_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type",
+    "Site_Rank"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Missouri_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Location_Description",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type",
+    "Site_Rank"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Colorado_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Yellowstone_River_GRP_Points_2025_5/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type",
+    "Site_Rank"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Lochsa_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Location_Description",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Kootenai_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Kootenai_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Location_Description",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/MF_Flathead_GRP_Points_2025_WFL1/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type"
+   ]
+  },
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Jocko_River_GRP_Points_2025/FeatureServer/0",
+   "nameField": "Site_Name",
+   "bufferM": 500,
+   "extraFields": [
+    "Site_Type",
+    "Site_Rank"
+   ]
+  }
+ ],
+ "receptorLayers": [],
+ "equipment": {
+  "enabled": true,
+  "entrainmentMs": 0.35,
+  "anchorSpacingFt": 100,
+  "reservePct": 20
+ },
+ "timingModel": "jobson"
 }

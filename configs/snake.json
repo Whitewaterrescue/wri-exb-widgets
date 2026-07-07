@@ -1,20 +1,39 @@
 {
-  "title": "Snake River GRP — Spill Trajectory",
-  "webmap": "3e3439cbf595463bb0cbd977c84ef333",
-  "safetyFactor": 1.5,
-  "minStreamOrder": 4,
-  "maxHours": 24,
-  "maxDistanceKm": 300,
-  "siteLayers": [
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/1",
-     "nameField": "site_name", "bufferM": 500, "where": "status <> 'rejected'",
-     "extraFields": ["river_mile", "strategy_type", "GlobalID"],
-     "boomLayer": {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/0",
-                   "siteKeyField": "site_globalid"}}
-  ],
-  "receptorLayers": [
-    {"url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_Research_Map_WFL1/FeatureServer/16",
-     "nameField": "name", "bufferM": 800}
-  ],
-  "equipment": {"enabled": true, "entrainmentMs": 0.35, "anchorSpacingFt": 100, "reservePct": 20}
+ "title": "Snake River GRP \u2014 Spill Trajectory",
+ "webmap": "3e3439cbf595463bb0cbd977c84ef333",
+ "safetyFactor": 1.5,
+ "minStreamOrder": 4,
+ "maxHours": 24,
+ "maxDistanceKm": 300,
+ "siteLayers": [
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/1",
+   "nameField": "site_name",
+   "bufferM": 500,
+   "where": "status <> 'rejected'",
+   "extraFields": [
+    "river_mile",
+    "strategy_type",
+    "GlobalID"
+   ],
+   "boomLayer": {
+    "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_GRP_Test_v2/FeatureServer/0",
+    "siteKeyField": "site_globalid"
+   }
+  }
+ ],
+ "receptorLayers": [
+  {
+   "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Snake_River_Research_Map_WFL1/FeatureServer/16",
+   "nameField": "name",
+   "bufferM": 800
+  }
+ ],
+ "equipment": {
+  "enabled": true,
+  "entrainmentMs": 0.35,
+  "anchorSpacingFt": 100,
+  "reservePct": 20
+ },
+ "timingModel": "jobson"
 }
