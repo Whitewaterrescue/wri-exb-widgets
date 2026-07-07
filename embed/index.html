@@ -77,8 +77,9 @@
     return;
   }
   if (params.get("webmap")) CFG.webmap = params.get("webmap");
+  if (params.get("asOf")) CFG.asOf = params.get("asOf"); // replay: pin historical flows
   if (CFG.title) { $("title").textContent = CFG.title; document.title = CFG.title; }
-  $("sfSel").value = String(CFG.safetyFactor ?? 1.5);
+  $("sfSel").value = String(parseFloat(params.get("sf")) || CFG.safetyFactor || 1.5);
 
   const APP_ID = params.get("appid") || "ZTWroggX3c8hdiJo"; // WRI Web Deliverables (GitHub Pages)
 
@@ -315,6 +316,7 @@
       minStreamOrder: CFG.minStreamOrder ?? 4,
       maxHours: CFG.maxHours ?? 24,
       maxDistanceKm: CFG.maxDistanceKm ?? 300,
+      asOf: CFG.asOf ?? null,
       verbose: false,
     });
 
@@ -334,14 +336,7 @@
         (fromCache ? " · recomputed instantly from cached hydrology" : "");
     }
 
-    $("armBtn").onclick = () => {
-      if (running || clickHandle) return;
-      $("status").textContent = "Click the spill location on the map…";
-      $("armBtn").textContent = "Click the map…";
-      clickHandle = view.on("click", async (evt) => {
-        clickHandle.remove(); clickHandle = null;
-        $("armBtn").textContent = "Set spill point";
-        const lat = evt.mapPoint.latitude, lon = evt.mapPoint.longitude;
+    async function runAt(lat, lon) {
         running = true;
         $("armBtn").disabled = true;
         $("results").innerHTML = ""; $("warnings").style.display = "none"; $("note").textContent = "";
@@ -379,8 +374,29 @@
           running = false;
           $("armBtn").disabled = false;
         }
+    }
+
+    $("armBtn").onclick = () => {
+      if (running || clickHandle) return;
+      $("status").textContent = "Click the spill location on the map…";
+      $("armBtn").textContent = "Click the map…";
+      clickHandle = view.on("click", (evt) => {
+        clickHandle.remove(); clickHandle = null;
+        $("armBtn").textContent = "Set spill point";
+        runAt(evt.mapPoint.latitude, evt.mapPoint.longitude);
       });
     };
+
+    // replay mode: ?lat=&lon=(&asOf=&sf=) re-runs a recorded trace automatically
+    if (params.get("lat") && params.get("lon")) {
+      view.when(() => {
+        const rlat = parseFloat(params.get("lat")), rlon = parseFloat(params.get("lon"));
+        view.goTo({ center: [rlon, rlat], zoom: 10 }).catch(() => {});
+        $("status").textContent = `Replaying recorded run at ${rlat.toFixed(4)}, ${rlon.toFixed(4)}` +
+          (CFG.asOf ? ` (flows as of ${CFG.asOf})` : "") + "…";
+        runAt(rlat, rlon);
+      });
+    }
 
     $("clearBtn").onclick = () => {
       if (clickHandle) { clickHandle.remove(); clickHandle = null; $("armBtn").textContent = "Set spill point"; }
@@ -394,8 +410,18 @@
     $("sfSel").onchange = () => { if (cache && !running) computeAndRender(parseFloat($("sfSel").value), true); };
     $("recordBtn").onclick = () => {
       if (lastResult && lastResult.runRecord) {
-        navigator.clipboard.writeText(JSON.stringify(lastResult.runRecord, null, 1))
-          .then(() => { $("status").textContent = "Run record copied to clipboard."; });
+        const rec = Object.assign({}, lastResult.runRecord);
+        // self-reproducing record: URL that re-runs this trace with flows pinned
+        // to the run date (NWIS historical) at the same spill point
+        const u = new URL(location.origin + location.pathname);
+        u.searchParams.set("config", params.get("config") || "all-grps");
+        u.searchParams.set("lat", cache.lat.toFixed(5));
+        u.searchParams.set("lon", cache.lon.toFixed(5));
+        u.searchParams.set("asOf", rec.as_of !== "live" ? rec.as_of : rec.generated_at.slice(0, 10));
+        u.searchParams.set("sf", $("sfSel").value);
+        rec.replay_url = u.toString();
+        navigator.clipboard.writeText(JSON.stringify(rec, null, 1))
+          .then(() => { $("status").textContent = "Run record copied (includes replay_url)."; });
       }
     };
   });
