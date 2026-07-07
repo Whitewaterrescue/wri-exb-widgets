@@ -1,0 +1,22 @@
+{
+  "name": "spill-trace",
+  "label": "Spill Trajectory",
+  "type": "widget",
+  "version": "1.0.0",
+  "exbVersion": "1.20.0",
+  "author": "Whitewater Rescue Institute",
+  "description": "Ephemeral spill-trajectory plume: click a spill point, get a time-colored downstream trace with hourly markers, strategy-site ETAs and receptor warnings. Nothing is written to any layer.",
+  "copyright": "WRI",
+  "license": "",
+  "properties": {},
+  "dependency": [
+    "jimu-arcgis"
+  ],
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 360,
+    "height": 560
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "safetyFactor": 1.5,
+  "minStreamOrder": 4,
+  "maxHours": 24,
+  "maxDistanceKm": 300,
+  "siteLayers": [],
+  "receptorLayers": [],
+  "equipment": {
+    "enabled": true,
+    "entrainmentMs": 0.35,
+    "anchorSpacingFt": 100,
+    "reservePct": 20
+  }
+}
