@@ -44,6 +44,7 @@
       <button id="armBtn" class="primary" disabled>Set spill point</button>
       <button id="clearBtn">Clear</button>
       <button id="recordBtn" disabled title="Copy run provenance record (JSON) for after-action documentation">⎘ Record</button>
+      <button id="hideBtn" disabled title="Hide/show the trajectory on the map without losing the run (briefings)">👁 Hide</button>
       <label style="margin-left:auto" title="Safety factor — changing it re-runs instantly from cached hydrology">
         SF <select id="sfSel">
           <option value="1.0">1.0</option><option value="1.25">1.25</option>
@@ -329,6 +330,9 @@
       renderResults(res);
       lastResult = res;
       $("recordBtn").disabled = false;
+      gfx.visible = true;
+      $("hideBtn").disabled = false;
+      $("hideBtn").textContent = "👁 Hide";
       $("diag").innerHTML = cache.fetchNotes.concat([`${res.sites.length} site(s) within buffer of the trace.`])
         .map((d) => `<div>${d}</div>`).join("");
       $("status").textContent =
@@ -408,6 +412,10 @@
     };
 
     $("sfSel").onchange = () => { if (cache && !running) computeAndRender(parseFloat($("sfSel").value), true); };
+    $("hideBtn").onclick = () => {
+      gfx.visible = !gfx.visible;
+      $("hideBtn").textContent = gfx.visible ? "👁 Hide" : "👁 Show";
+    };
     $("recordBtn").onclick = () => {
       if (lastResult && lastResult.runRecord) {
         const rec = Object.assign({}, lastResult.runRecord);
