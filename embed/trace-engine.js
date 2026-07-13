@@ -20,7 +20,7 @@
  *   6. snap click to streamorde >= minStreamOrder
  */
 
-export const ENGINE_VERSION = "1.3.0";
+export const ENGINE_VERSION = "1.4.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -50,6 +50,7 @@ export const DEFAULT_CONFIG = {
   siteProviders: [],
   receptorProviders: [],
   upstreamGaugeKm: 30,        // search UM this far for an upstream anchor gauge; 0 = off
+  qInterp: "drainage-area",   // 'drainage-area' (Q jumps at confluences) | 'distance' (legacy linear smear)
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
   timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
@@ -428,6 +429,39 @@ function assembleTrace(lat, lon, geoms, vaa, resolutionM, log) {
   return [pts, segs.length ? segs[0].gnis_name : null];
 }
 
+/**
+ * DA-weighted discharge interpolator (v1.4): Q as a piecewise-linear function
+ * of drainage area between gauges, DA-ratio extrapolated outside the gauge
+ * range (uniform-yield assumption — same semantics as the single-gauge path).
+ * Because DA jumps at confluences, the Q jump lands AT the confluence instead
+ * of smearing linearly over the inter-gauge distance; it also can't back-clamp
+ * a post-confluence gauge's full Q onto a small upstream tributary.
+ * Gauges whose NWIS DA breaks downstream monotonicity are dropped (NWIS and
+ * NHDPlus delineations disagree occasionally). Returns null when fewer than 2
+ * monotonic gauges remain — caller falls back to distance interpolation.
+ */
+export function daWeightedQ(gd) {
+  const kept = [];
+  for (const g of gd) {
+    if (!(g.drainage_area > 0) || !(g.discharge >= 0)) continue;
+    if (kept.length && g.drainage_area <= kept[kept.length - 1].drainage_area) continue;
+    kept.push(g);
+  }
+  if (kept.length < 2) return null;
+  const fQ = interpClamped(kept.map((g) => g.drainage_area), kept.map((g) => g.discharge));
+  const da0 = kept[0].drainage_area, q0 = kept[0].discharge;
+  const daN = kept[kept.length - 1].drainage_area, qN = kept[kept.length - 1].discharge;
+  return {
+    kept,
+    q: (da) => {
+      if (!(da > 0)) return 1.0;
+      if (da <= da0) return q0 * (da / da0);
+      if (da >= daN) return qN * (da / daN);
+      return fQ(da);
+    },
+  };
+}
+
 /** Clamped linear interpolation (scipy interp1d with clamped fill_value). */
 function interpClamped(xs, ys) {
   return (x) => {
@@ -670,10 +704,29 @@ export function computeTrace(data, config = {}) {
 
   let qMethod, qConfidence;
   const anchored = gd.some((g) => g.upstream_anchor);
+  let qInterpUsed = null;
   if (gd.length >= 2) {
-    const fQ = interpClamped(gd.map((g) => g.trace_dist), gd.map((g) => g.discharge));
-    for (const r of rows) r.Q_cfs = Math.max(fQ(r.cum_dist), 1.0);
-    qMethod = anchored ? "gauge-interpolation+upstream-anchor" : "gauge-interpolation";
+    const daQ = cfg.qInterp === "drainage-area" ? daWeightedQ(gd) : null;
+    if (daQ) {
+      // interpolate on the running-max DA: ArtificialPath/divergence reaches can
+      // carry 0/dipping totdasqkm, which must not crater Q mid-trace
+      if (daQ.kept.length < gd.length)
+        log(`  DA interp: dropped ${gd.length - daQ.kept.length} gauge(s) with non-monotonic NWIS DA`);
+      let runMax = 0;
+      for (const r of rows) {
+        runMax = Math.max(runMax, r.drainage_area_sqmi);
+        r.Q_cfs = Math.max(daQ.q(runMax), 1.0);
+      }
+      qMethod = anchored ? "gauge-DA-interpolation+upstream-anchor" : "gauge-DA-interpolation";
+      qInterpUsed = "drainage-area";
+    } else {
+      if (cfg.qInterp === "drainage-area")
+        log("  DA interp unavailable (<2 monotonic gauge DAs) — falling back to distance interpolation");
+      const fQ = interpClamped(gd.map((g) => g.trace_dist), gd.map((g) => g.discharge));
+      for (const r of rows) r.Q_cfs = Math.max(fQ(r.cum_dist), 1.0);
+      qMethod = anchored ? "gauge-interpolation+upstream-anchor" : "gauge-interpolation";
+      qInterpUsed = "distance";
+    }
     qConfidence = "HIGH";
   } else if (gd.length === 1) {
     const g = gd[0];
@@ -866,6 +919,7 @@ export function computeTrace(data, config = {}) {
     as_of: data.asOf || "live",
     q_method: qMethod,
     q_confidence: qConfidence,
+    q_interp: qInterpUsed,
     gauges: gd.map((g) => ({
       station_id: g.station_id, name: g.name, discharge_cfs: g.discharge, trace_km: Math.round(g.trace_dist / 100) / 10,
       ...(g.upstream_anchor ? {
