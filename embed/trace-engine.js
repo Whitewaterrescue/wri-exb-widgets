@@ -20,7 +20,7 @@
  *   6. snap click to streamorde >= minStreamOrder
  */
 
-export const ENGINE_VERSION = "1.2.0";
+export const ENGINE_VERSION = "1.3.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -49,6 +49,7 @@ export const DEFAULT_CONFIG = {
   widthWindowPoints: 100,     // trace points per override sampling window (~10 km)
   siteProviders: [],
   receptorProviders: [],
+  upstreamGaugeKm: 30,        // search UM this far for an upstream anchor gauge; 0 = off
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
   timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
@@ -213,8 +214,8 @@ async function nldiDmFlowlines(comid, distanceKm) {
   return geoms;
 }
 
-async function nldiDmGauges(comid, distanceKm) {
-  const j = await getJson(`${NLDI_BASE}/linked-data/comid/${comid}/navigation/DM/nwissite`, {
+async function nldiGauges(comid, distanceKm, mode) {
+  const j = await getJson(`${NLDI_BASE}/linked-data/comid/${comid}/navigation/${mode}/nwissite`, {
     params: { distance: String(Math.trunc(distanceKm)) },
   });
   const out = [];
@@ -229,6 +230,38 @@ async function nldiDmGauges(comid, distanceKm) {
     });
   }
   return out;
+}
+
+/**
+ * Merge the nearest upstream main-stem gauge into the located-gauge list as a
+ * virtual gauge at the spill point (trace_dist 0). Without this, clicking just
+ * DOWNSTREAM of a gauge drops it from the DM navigation and the next gauge's Q
+ * is back-clamped onto the first reach — wildly wrong when that gauge sits
+ * below a major confluence (Gallatin below Logan -> Missouri at Toston).
+ * Q is transferred by drainage-area ratio (standard USGS transfer), which also
+ * keeps the anchor honest when the UM path crosses a confluence: the ratio
+ * scales a tributary gauge back up to the flow at the click.
+ * No-op when an on-trace gauge already sits within anchorSkipM of the start
+ * (it already anchors the boundary), the station is already located, or the
+ * DA transfer is outside its credible range.
+ */
+export function mergeUpstreamAnchor(gd, up, spillDaSqmi, { anchorSkipM = 500, daRatioMax = 4 } = {}) {
+  if (!up || !(up.discharge >= 0) || !(up.drainage_area > 0) || !(spillDaSqmi > 0)) return false;
+  if (gd.some((g) => g.station_id === up.station_id)) return false;
+  if (gd.some((g) => g.trace_dist <= anchorSkipM)) return false;
+  const ratio = spillDaSqmi / up.drainage_area;
+  if (ratio < 1 / daRatioMax || ratio > daRatioMax) return false;
+  const [w, dep] = estimateGeometryPayton(spillDaSqmi);
+  gd.push({
+    station_id: up.station_id, name: up.name, lat: up.lat, lon: up.lon,
+    discharge: up.discharge * ratio, drainage_area: spillDaSqmi,
+    area: w * dep, trace_dist: 0.0,
+    upstream_anchor: true,
+    anchor_gauge_q_cfs: up.discharge, anchor_gauge_da_sqmi: up.drainage_area,
+    anchor_upstream_m: up.upstream_m ?? null,
+  });
+  gd.sort((a, b) => a.trace_dist - b.trace_dist);
+  return true;
 }
 
 /** VAAs for a list of COMIDs from USGS geoserver (batched POST). */
@@ -517,8 +550,24 @@ export async function fetchTraceData(lat, lon, config = {}) {
   }
 
   // 3. discharge inputs: NLDI downstream gauges -> NWIS Q (+DA), located on trace
-  const gauges = await nldiDmGauges(comid, cfg.maxDistanceKm);
-  const ginfo = await gaugeInfo(gauges.map((g) => g.station_id), cfg.asOf);
+  const gauges = await nldiGauges(comid, cfg.maxDistanceKm, "DM");
+  // upstream-anchor candidates: nearest UM gauges (fixes the discontinuity when
+  // the click is just below a gauge and DM navigation no longer sees it)
+  let upCands = [];
+  if (cfg.upstreamGaugeKm > 0) {
+    try {
+      const dmIds = new Set(gauges.map((g) => g.station_id));
+      upCands = (await nldiGauges(comid, cfg.upstreamGaugeKm, "UM"))
+        .filter((u) => !dmIds.has(u.station_id))
+        .map((u) => ({ ...u, upstream_m: haversineM(lat, lon, u.lat, u.lon) }))
+        .filter((u) => u.upstream_m <= cfg.upstreamGaugeKm * 1000)
+        .sort((a, b) => a.upstream_m - b.upstream_m);
+    } catch (e) {
+      log(`  UM gauge lookup failed (${String(e).slice(0, 80)}) — no upstream anchor`);
+    }
+  }
+  const allIds = [...new Set([...gauges, ...upCands].map((g) => g.station_id))];
+  const ginfo = await gaugeInfo(allIds, cfg.asOf);
   const gd = [];
   for (const g of gauges) {
     const i = ginfo.get(g.station_id) || {};
@@ -536,8 +585,23 @@ export async function fetchTraceData(lat, lon, config = {}) {
     });
   }
   gd.sort((a, b) => a.trace_dist - b.trace_dist);
+  const spillDaSqmi = rows[0].drainage_area_sqmi;
+  for (const u of upCands) {
+    const i = ginfo.get(u.station_id) || {};
+    if (i.discharge === undefined || !i.drainage_area) continue;
+    if (mergeUpstreamAnchor(gd, { ...u, discharge: i.discharge, drainage_area: i.drainage_area }, spillDaSqmi)) {
+      log(
+        `  upstream anchor ${u.station_id} ${u.name.slice(0, 30)}: ${Math.round(i.discharge)} cfs ` +
+        `@ ${(u.upstream_m / 1000).toFixed(1)} km upstream -> ${Math.round(i.discharge * (spillDaSqmi / i.drainage_area))} cfs ` +
+        `at spill point (DA x${(spillDaSqmi / i.drainage_area).toFixed(2)})`,
+      );
+      break;
+    }
+    // an on-trace gauge near the start already anchors the boundary — stop looking
+    if (gd.some((g) => !g.upstream_anchor && g.trace_dist <= 500)) break;
+  }
   for (const g of gd) {
-    log(`  gauge ${g.station_id} ${g.name.slice(0, 38).padEnd(38)} ${String(Math.round(g.discharge)).padStart(8)} cfs @ ${(g.trace_dist / 1000).toFixed(1).padStart(6)} km`);
+    log(`  gauge ${g.station_id} ${g.name.slice(0, 38).padEnd(38)} ${String(Math.round(g.discharge)).padStart(8)} cfs @ ${(g.trace_dist / 1000).toFixed(1).padStart(6)} km${g.upstream_anchor ? " (upstream anchor)" : ""}`);
   }
 
   // 4. site/receptor features (fetched in parallel; joined in computeTrace)
@@ -605,16 +669,19 @@ export function computeTrace(data, config = {}) {
     : new Date().getMonth() + 1;
 
   let qMethod, qConfidence;
+  const anchored = gd.some((g) => g.upstream_anchor);
   if (gd.length >= 2) {
     const fQ = interpClamped(gd.map((g) => g.trace_dist), gd.map((g) => g.discharge));
     for (const r of rows) r.Q_cfs = Math.max(fQ(r.cum_dist), 1.0);
-    qMethod = "gauge-interpolation"; qConfidence = "HIGH";
+    qMethod = anchored ? "gauge-interpolation+upstream-anchor" : "gauge-interpolation";
+    qConfidence = "HIGH";
   } else if (gd.length === 1) {
     const g = gd[0];
     for (const r of rows) {
       r.Q_cfs = Math.max(g.discharge * (r.drainage_area_sqmi / g.drainage_area), 1.0);
     }
-    qMethod = "single-gauge-DA-ratio"; qConfidence = "MEDIUM";
+    qMethod = anchored ? "upstream-anchor-DA-ratio" : "single-gauge-DA-ratio";
+    qConfidence = "MEDIUM";
     log("  1 gauge: scaling by drainage-area ratio");
   } else {
     // EROM per-reach monthly modeled flow (gauge-adjusted; captures seasonal
@@ -799,7 +866,15 @@ export function computeTrace(data, config = {}) {
     as_of: data.asOf || "live",
     q_method: qMethod,
     q_confidence: qConfidence,
-    gauges: gd.map((g) => ({ station_id: g.station_id, name: g.name, discharge_cfs: g.discharge, trace_km: Math.round(g.trace_dist / 100) / 10 })),
+    gauges: gd.map((g) => ({
+      station_id: g.station_id, name: g.name, discharge_cfs: g.discharge, trace_km: Math.round(g.trace_dist / 100) / 10,
+      ...(g.upstream_anchor ? {
+        upstream_anchor: true,
+        anchor_gauge_q_cfs: g.anchor_gauge_q_cfs,
+        anchor_gauge_da_sqmi: g.anchor_gauge_da_sqmi,
+        anchor_upstream_km: g.anchor_upstream_m !== null ? Math.round(g.anchor_upstream_m / 100) / 10 : null,
+      } : {}),
+    })),
     erom_month: qMethod.startsWith("erom") ? eromMonth : null,
     width_source: { glow_matched_points: glowMatched, total_points: rows.length, braided_points_formula_width: braidedN },
     jobson_degraded_points: jobson ? jobsonDegraded : null,
