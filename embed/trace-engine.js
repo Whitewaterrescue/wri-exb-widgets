@@ -20,12 +20,13 @@
  *   6. snap click to streamorde >= minStreamOrder
  */
 
-export const ENGINE_VERSION = "1.4.0";
+export const ENGINE_VERSION = "1.5.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
 const NWIS_IV = "https://waterservices.usgs.gov/nwis/iv/";
 const NWIS_SITE = "https://waterservices.usgs.gov/nwis/site/";
+const NWIS_STAT = "https://waterservices.usgs.gov/nwis/stat/";
 
 /**
  * NHDPlus MR waterbody flags lag reality — reaches through REMOVED dams still
@@ -51,6 +52,7 @@ export const DEFAULT_CONFIG = {
   receptorProviders: [],
   upstreamGaugeKm: 30,        // search UM this far for an upstream anchor gauge; 0 = off
   qInterp: "drainage-area",   // 'drainage-area' (Q jumps at confluences) | 'distance' (legacy linear smear)
+  gaugeStatFallback: true,    // gauge IV feed down -> period-of-record median daily flow (Payton's get_discharge pattern)
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
   timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
@@ -256,6 +258,7 @@ export function mergeUpstreamAnchor(gd, up, spillDaSqmi, { anchorSkipM = 500, da
   gd.push({
     station_id: up.station_id, name: up.name, lat: up.lat, lon: up.lon,
     discharge: up.discharge * ratio, drainage_area: spillDaSqmi,
+    q_source: up.q_source || "iv",
     area: w * dep, trace_dist: 0.0,
     upstream_anchor: true,
     anchor_gauge_q_cfs: up.discharge, anchor_gauge_da_sqmi: up.drainage_area,
@@ -308,8 +311,12 @@ async function vaaBatch(comids) {
   return out;
 }
 
-/** Discharge (cfs) + drainage area (sq mi) per gauge via plain NWIS REST. */
-async function gaugeInfo(stationIds, asOf = null) {
+/** Discharge (cfs) + drainage area (sq mi) per gauge via plain NWIS REST.
+ *  statFallback (v1.5, Payton's get_discharge pattern): gauges whose IV feed
+ *  is down/negative get the period-of-record MEDIAN daily flow (stat service
+ *  p50, needs >3 years of record) for the run date's calendar day, flagged
+ *  q_source='stat-p50' so the run can warn it isn't live conditions. */
+async function gaugeInfo(stationIds, asOf = null, statFallback = false) {
   const info = new Map();
   if (!stationIds.length) return info;
   const sites = stationIds.join(",");
@@ -349,9 +356,47 @@ async function gaugeInfo(stationIds, asOf = null) {
       if (q >= 0) {
         if (!info.has(sid)) info.set(sid, {});
         info.get(sid).discharge = q;
+        info.get(sid).q_source = "iv";
       }
     }
   } catch { /* ignore — matches Python */ }
+
+  // median-daily-flow fallback for gauges the IV pass didn't cover
+  if (statFallback) {
+    const missing = stationIds.filter((s) => info.get(s)?.discharge === undefined);
+    const [month, day] = asOf
+      ? [parseInt(asOf.slice(5, 7), 10), parseInt(asOf.slice(8, 10), 10)]
+      : [new Date().getMonth() + 1, new Date().getDate()];
+    const STAT_CHUNK = 10; // stat service 400s above 10 sites per request
+    for (let c = 0; c < missing.length; c += STAT_CHUNK) {
+      try {
+        const text = await getText(NWIS_STAT, {
+          format: "rdb", sites: missing.slice(c, c + STAT_CHUNK).join(","), parameterCd: "00060",
+          statReportType: "daily", statTypeCd: "p50",
+        });
+        const lines = text.split("\n").filter((l) => l && !l.startsWith("#"));
+        if (lines.length >= 2) {
+          const hdr = lines[0].split("\t");
+          const col = (name) => hdr.indexOf(name);
+          const [iSite, iMon, iDay, iCount, iP50] =
+            ["site_no", "month_nu", "day_nu", "count_nu", "p50_va"].map(col);
+          for (const line of lines.slice(2)) {
+            const p = line.split("\t");
+            if (p.length <= Math.max(iSite, iMon, iDay, iCount, iP50)) continue;
+            const sid = p[iSite];
+            if (info.get(sid)?.discharge !== undefined) continue; // first matching series wins
+            if (parseInt(p[iMon], 10) !== month || parseInt(p[iDay], 10) !== day) continue;
+            if (!(parseInt(p[iCount], 10) > 3)) continue; // Payton's record-length rule
+            const q = parseFloat(p[iP50]);
+            if (!(q >= 0)) continue;
+            if (!info.has(sid)) info.set(sid, {});
+            info.get(sid).discharge = q;
+            info.get(sid).q_source = "stat-p50";
+          }
+        }
+      } catch { /* stat service down -> this chunk's gauges stay dropped, as before */ }
+    }
+  }
   return info;
 }
 
@@ -601,7 +646,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     }
   }
   const allIds = [...new Set([...gauges, ...upCands].map((g) => g.station_id))];
-  const ginfo = await gaugeInfo(allIds, cfg.asOf);
+  const ginfo = await gaugeInfo(allIds, cfg.asOf, cfg.gaugeStatFallback);
   const gd = [];
   for (const g of gauges) {
     const i = ginfo.get(g.station_id) || {};
@@ -615,15 +660,28 @@ export async function fetchTraceData(lat, lon, config = {}) {
     const [w, dep] = estimateGeometryPayton(i.drainage_area);
     gd.push({
       ...g, discharge: i.discharge, drainage_area: i.drainage_area,
+      q_source: i.q_source || "iv",
       area: w * dep, trace_dist: rows[idx].cum_dist,
     });
   }
   gd.sort((a, b) => a.trace_dist - b.trace_dist);
+  // median-flow gauges are a rescue, not a supplement: with ANY live gauge on
+  // the trace, live-only interpolation beats splicing a historical median into
+  // the profile (median != today's flow in runoff or drought). They engage
+  // only on a full feed outage or a pre-IV-era asOf date.
+  if (gd.some((g) => g.q_source === "iv") && gd.some((g) => g.q_source === "stat-p50")) {
+    const dropped = gd.filter((g) => g.q_source === "stat-p50").map((g) => g.station_id);
+    log(`  median-fallback gauges suppressed (live gauges available): ${dropped.join(", ")}`);
+    for (let i = gd.length - 1; i >= 0; i--) if (gd[i].q_source === "stat-p50") gd.splice(i, 1);
+  }
   const spillDaSqmi = rows[0].drainage_area_sqmi;
   for (const u of upCands) {
     const i = ginfo.get(u.station_id) || {};
     if (i.discharge === undefined || !i.drainage_area) continue;
-    if (mergeUpstreamAnchor(gd, { ...u, discharge: i.discharge, drainage_area: i.drainage_area }, spillDaSqmi)) {
+    // same rescue-only rule for the upstream anchor: no median anchors when
+    // live gauges are on the trace
+    if ((i.q_source || "iv") === "stat-p50" && gd.some((g) => g.q_source === "iv")) continue;
+    if (mergeUpstreamAnchor(gd, { ...u, discharge: i.discharge, drainage_area: i.drainage_area, q_source: i.q_source || "iv" }, spillDaSqmi)) {
       log(
         `  upstream anchor ${u.station_id} ${u.name.slice(0, 30)}: ${Math.round(i.discharge)} cfs ` +
         `@ ${(u.upstream_m / 1000).toFixed(1)} km upstream -> ${Math.round(i.discharge * (spillDaSqmi / i.drainage_area))} cfs ` +
@@ -635,7 +693,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     if (gd.some((g) => !g.upstream_anchor && g.trace_dist <= 500)) break;
   }
   for (const g of gd) {
-    log(`  gauge ${g.station_id} ${g.name.slice(0, 38).padEnd(38)} ${String(Math.round(g.discharge)).padStart(8)} cfs @ ${(g.trace_dist / 1000).toFixed(1).padStart(6)} km${g.upstream_anchor ? " (upstream anchor)" : ""}`);
+    log(`  gauge ${g.station_id} ${g.name.slice(0, 38).padEnd(38)} ${String(Math.round(g.discharge)).padStart(8)} cfs @ ${(g.trace_dist / 1000).toFixed(1).padStart(6)} km${g.upstream_anchor ? " (upstream anchor)" : ""}${g.q_source === "stat-p50" ? " (MEDIAN fallback)" : ""}`);
   }
 
   // 4. site/receptor features (fetched in parallel; joined in computeTrace)
@@ -893,6 +951,15 @@ export function computeTrace(data, config = {}) {
   sites.sort((a, b) => a.eta_hr - b.eta_hr);
   const warnings = impoundNote ? [impoundNote] : [];
   if (qConfidence !== "HIGH") warnings.unshift(`Flow estimate: ${qConfidence} (${qMethod})`);
+  {
+    const statG = gd.filter((g) => g.q_source === "stat-p50");
+    if (statG.length) {
+      warnings.unshift(
+        `Gauge feed down: ${statG.map((g) => g.station_id).join(", ")} using ` +
+        `period-of-record MEDIAN flow for this date — NOT live conditions`,
+      );
+    }
+  }
   for (const s of receptorSets || []) {
     for (const r of proximity(s)) {
       warnings.push(
@@ -922,6 +989,7 @@ export function computeTrace(data, config = {}) {
     q_interp: qInterpUsed,
     gauges: gd.map((g) => ({
       station_id: g.station_id, name: g.name, discharge_cfs: g.discharge, trace_km: Math.round(g.trace_dist / 100) / 10,
+      q_source: g.q_source || "iv",
       ...(g.upstream_anchor ? {
         upstream_anchor: true,
         anchor_gauge_q_cfs: g.anchor_gauge_q_cfs,
