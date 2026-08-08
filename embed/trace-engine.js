@@ -18,15 +18,26 @@
  *   4. width override sampled in windows; failure degrades to formula widths
  *   5. NLDI/geoserver empty-200 -> retry 3x with backoff
  *   6. snap click to streamorde >= minStreamOrder
+ *
+ * Corridor mode (v1.6): US federal services (NLDI/NHDPlus/NWIS) end at the
+ * border. config.corridors lists precomputed corridor files (see
+ * corridors/build_corridors.py) — a stationed centerline + authored hydraulic
+ * attributes + a flow model bound to ECCC (Water Survey of Canada) gauges.
+ * A click that lands within a corridor's snap_m runs entirely on corridor
+ * data; corridors chain downstream via continues_to (Brunette -> Fraser),
+ * with short confluence gaps bridged by a straight connector that inherits
+ * the DOWNSTREAM corridor's hydraulics. All physics (computeTrace) is shared
+ * with the US path.
  */
 
-export const ENGINE_VERSION = "1.5.0";
+export const ENGINE_VERSION = "1.7.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
 const NWIS_IV = "https://waterservices.usgs.gov/nwis/iv/";
 const NWIS_SITE = "https://waterservices.usgs.gov/nwis/site/";
 const NWIS_STAT = "https://waterservices.usgs.gov/nwis/stat/";
+const ECCC_API = "https://api.weather.gc.ca/collections";
 
 /**
  * NHDPlus MR waterbody flags lag reality — reaches through REMOVED dams still
@@ -55,9 +66,34 @@ export const DEFAULT_CONFIG = {
   gaugeStatFallback: true,    // gauge IV feed down -> period-of-record median daily flow (Payton's get_discharge pattern)
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
+  corridors: [],              // corridor docs or URLs (Canadian rivers, see corridors/)
+  corridorGapMaxM: 2000,      // max confluence gap bridged when chaining corridors
   timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
   asOf: null,                 // 'YYYY-MM-DD' historical Q; null = live
   verbose: true,
+  openWater: {},              // overrides for DEFAULT_OPENWATER (v1.7 lake/reservoir mode)
+};
+
+/** Open-water (lake/reservoir) mode — GNOME-style particle transport
+ *  (NOAA Tech Doc NOS OR&R 40, public domain). Validated in openwater-spike/. */
+export const DEFAULT_OPENWATER = {
+  enabled: true,              // lake-click dispatch + impoundment continuation
+  minLakeSqKm: 1.0,           // PIP hits smaller than this stay on the river path
+                              // (guards removed-dam relic polygons, farm ponds)
+  riverOverrideM: 400,        // non-impounded reach this close → river mode wins
+                              // (dam tailraces sit inside reservoir polygons)
+  nParticles: 1000,
+  durationHr: 24,             // sim length from water entry (continuations too)
+  timestepS: 900,
+  windageMin: 0.01,           // GNOME 1–4% of U10, uniform per particle
+  windageMax: 0.04,
+  windagePersistS: 900,
+  diffusionM2s: 1.0,          // lakes/protected water (GNOME "low"); coastal = 10
+  refloatHalfLifeHr: 1.0,
+  continueAtImpoundment: true,
+  shoreGapSegs: 3,            // beached-cluster merge tolerance (shoreline segments)
+  maxShoreImpacts: 10,
+  seed: 12345,                // deterministic replays; runRecord carries it
 };
 
 // ---------------------------------------------------------------- helpers
@@ -519,6 +555,321 @@ function interpClamped(xs, ys) {
   };
 }
 
+// ---------------------------------------------------------------- corridors (v1.6)
+//
+// A corridor doc (built offline by corridors/build_corridors.py):
+//   { id, name, snap_m, continues_to, tidal_from_km, impoundments:[{from_km,
+//     to_km, name}], warnings:[...], attrs:{da_km2|slope|width_m|depth_m:
+//     [[km, value], ...]}, flow:{provider, ...}, station_km:[...],
+//     vertices:[[lon,lat], ...] }
+// Flow providers:
+//   eccc-live-sum  — sum live ECCC discharge over flow.stations (each
+//                    {id, name, da_km2}); DA-ratio transferred along the
+//                    corridor. asOf uses the ECCC daily-mean archive.
+//   monthly-median — flow.monthly_median_m3s[month] at flow.ref_da_km2
+//                    (rivers with no active gauge, e.g. the Brunette).
+
+const CORRIDOR_CACHE = new Map(); // url -> corridor doc
+
+async function loadCorridors(list, log) {
+  const out = [];
+  for (const entry of list || []) {
+    if (entry && typeof entry === "object" && entry.vertices) { out.push(entry); continue; }
+    const url = typeof entry === "string" ? entry : entry?.url;
+    if (!url) continue;
+    if (!CORRIDOR_CACHE.has(url)) {
+      try {
+        CORRIDOR_CACHE.set(url, await getJson(url, { timeoutMs: 30000 }));
+      } catch (e) {
+        log(`  corridor load FAILED (${url}): ${String(e).slice(0, 80)}`);
+        CORRIDOR_CACHE.set(url, null);
+      }
+    }
+    const doc = CORRIDOR_CACHE.get(url);
+    if (doc) out.push(doc);
+  }
+  return out;
+}
+
+/** Clamped linear interpolation over authored [[km, value], ...] breakpoints. */
+function corridorAttr(bps, km, fallback = 0) {
+  if (!bps || !bps.length) return fallback;
+  if (km <= bps[0][0]) return bps[0][1];
+  const last = bps[bps.length - 1];
+  if (km >= last[0]) return last[1];
+  for (let i = 1; i < bps.length; i++) {
+    if (bps[i][0] >= km) {
+      const t = (km - bps[i - 1][0]) / (bps[i][0] - bps[i - 1][0]);
+      return bps[i - 1][1] + t * (bps[i][1] - bps[i - 1][1]);
+    }
+  }
+  return last[1];
+}
+
+function nearestCorridorVertex(lat, lon, corr) {
+  let best = Infinity, idx = 0;
+  const v = corr.vertices;
+  for (let i = 0; i < v.length; i++) {
+    const d = haversineM(lat, lon, v[i][1], v[i][0]);
+    if (d < best) { best = d; idx = i; }
+  }
+  return { idx, distM: best };
+}
+
+/** Point attributes sampled from a corridor at its native stationing (km). */
+function corridorPoint(corr, lon, lat, km, connector = false) {
+  const a = corr.attrs || {};
+  const impound = (corr.impoundments || []).find((z) => km >= z.from_km && km <= z.to_km);
+  return {
+    lon, lat,
+    drainage_area_km2: corridorAttr(a.da_km2, km, 0),
+    slope: Math.max(corridorAttr(a.slope, km, 0.001), 0.00001),
+    corridor_width_m: corridorAttr(a.width_m, km, 0),
+    depth_override: corridorAttr(a.depth_m, km, 0),
+    tidal: corr.tidal_from_km !== null && corr.tidal_from_km !== undefined && km >= corr.tidal_from_km,
+    ftype: connector ? "CorridorConnector" : "Corridor",
+    wbareatype: impound ? "Reservoir" : "StreamRiver",
+    comid: null,
+    gnis_name: impound ? (impound.name || corr.name) : corr.name,
+    qe_ma: null, qe_monthly: null,
+    divergence: 0,
+    corridor_id: corr.id,
+    corridor_km: km,
+  };
+}
+
+/** Live/median discharge for a corridor's flow model.
+ *  Returns { qM3s, daKm2, source, note } or null (caller warns + errors). */
+async function corridorFlow(corr, asOf, log) {
+  const flow = corr.flow || {};
+  const month = asOf ? parseInt(asOf.slice(5, 7), 10) : new Date().getMonth() + 1;
+
+  const medians = flow.monthly_median_m3s || null;
+  const median = medians && medians[String(month)] > 0
+    ? { qM3s: medians[String(month)], daKm2: flow.ref_da_km2, source: "monthly-median",
+        note: flow.source_note || null }
+    : null;
+
+  if (flow.provider === "eccc-live-sum") {
+    let qSum = 0, daSum = 0;
+    const live = [], down = [];
+    for (const st of flow.stations || []) {
+      try {
+        let q = null;
+        if (asOf) {
+          const j = await getJson(`${ECCC_API}/hydrometric-daily-mean/items`, {
+            params: { STATION_NUMBER: st.id, DATE: asOf, f: "json", limit: "5", skipGeometry: "true" },
+            timeoutMs: 30000,
+          });
+          for (const f of j.features || []) {
+            const v = f.properties?.DISCHARGE;
+            if (v !== null && v !== undefined && v >= 0) { q = Number(v); break; }
+          }
+        } else {
+          const j = await getJson(`${ECCC_API}/hydrometric-realtime/items`, {
+            params: {
+              STATION_NUMBER: st.id, f: "json", limit: "48",
+              sortby: "-DATETIME", skipGeometry: "true",
+              properties: "DISCHARGE,DATETIME,STATION_NUMBER",
+            },
+            timeoutMs: 30000,
+          });
+          for (const f of j.features || []) {
+            const v = f.properties?.DISCHARGE;
+            if (v !== null && v !== undefined && v >= 0) { q = Number(v); break; }
+          }
+        }
+        if (q !== null) { qSum += q; daSum += st.da_km2 || 0; live.push(st.id); }
+        else down.push(st.id);
+      } catch (e) {
+        down.push(st.id);
+        log(`  ECCC gauge ${st.id} failed: ${String(e).slice(0, 60)}`);
+      }
+    }
+    // stations without per-station da_km2: usable only when ALL report live
+    if (live.length === (flow.stations || []).length && !(daSum > 0)) daSum = flow.ref_da_km2 || 0;
+    if (live.length && daSum > 0) {
+      return {
+        qM3s: qSum, daKm2: daSum, source: "eccc-iv",
+        note: `ECCC live: ${live.join("+")}` + (down.length ? ` (feed down: ${down.join(",")})` : ""),
+      };
+    }
+    if (median) {
+      log(`  ECCC feed down for ${corr.id} — falling back to monthly median`);
+      return { ...median, note: `ECCC feed DOWN (${down.join(",")}) — ${median.note || "historical monthly median"}` };
+    }
+    return null;
+  }
+
+  if (flow.provider === "monthly-median") return median;
+  return median; // unknown provider — best effort
+}
+
+/**
+ * Corridor-mode fetchTraceData: rows + virtual gauges from corridor docs.
+ * Mirrors the US path's output shape exactly, so computeTrace is unchanged.
+ */
+async function fetchCorridorTraceData(lat, lon, corr, allCorridors, cfg, log) {
+  const byId = new Map(allCorridors.map((c) => [c.id, c]));
+
+  // 1. downstream chain, cycle-guarded
+  const chain = [corr];
+  const seen = new Set([corr.id]);
+  let cur = corr;
+  while (cur.continues_to && byId.has(cur.continues_to) && !seen.has(cur.continues_to)) {
+    cur = byId.get(cur.continues_to);
+    chain.push(cur);
+    seen.add(cur.id);
+  }
+
+  // 2. assemble attributed points: click -> corridor end, then chained
+  //    corridors from their join vertex, bridging gaps with connectors
+  const { idx: startIdx, distM: snapDistM } = nearestCorridorVertex(lat, lon, corr);
+  const pts = [];
+  const corridorMeta = [];
+  for (let ci = 0; ci < chain.length; ci++) {
+    const c = chain[ci];
+    let fromIdx;
+    if (ci === 0) fromIdx = startIdx;
+    else {
+      const prev = pts[pts.length - 1];
+      const { idx, distM } = nearestCorridorVertex(prev.lat, prev.lon, c);
+      if (distM > cfg.corridorGapMaxM) {
+        log(`  corridor chain stops: ${chain[ci - 1].id} -> ${c.id} gap ${(distM / 1000).toFixed(2)} km > max`);
+        break;
+      }
+      // straight connector through the confluence gap, attributed with the
+      // DOWNSTREAM corridor's hydraulics at the join (it is that river's water)
+      if (distM > 30) {
+        const joinKm = c.station_km[idx];
+        const [jLon, jLat] = c.vertices[idx];
+        const steps = Math.max(1, Math.ceil(distM / cfg.resolutionM));
+        for (let s = 1; s <= steps; s++) {
+          const t = s / steps;
+          pts.push(corridorPoint(c, prev.lon + (jLon - prev.lon) * t,
+            prev.lat + (jLat - prev.lat) * t, joinKm, true));
+        }
+        log(`  connector: ${chain[ci - 1].id} -> ${c.id} (${Math.round(distM)} m, ${c.name} hydraulics)`);
+      }
+      fromIdx = idx;
+    }
+    const firstPt = pts.length;
+    for (let i = fromIdx; i < c.vertices.length; i++) {
+      pts.push(corridorPoint(c, c.vertices[i][0], c.vertices[i][1], c.station_km[i]));
+    }
+    corridorMeta.push({ id: c.id, name: c.name, from_km: c.station_km[fromIdx], first_pt: firstPt });
+  }
+  if (pts.length < 2) throw new Error("corridor trace too short");
+
+  // downsample to cfg.resolutionM (corridor vertices are ~50 m)
+  let sampled = [pts[0]];
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    acc += haversineM(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+    if (acc >= cfg.resolutionM || i === pts.length - 1) { sampled.push(pts[i]); acc = 0; }
+  }
+
+  // 3. rows — same shape/derived fields as the US path
+  const rows = sampled.map((p) => ({ ...p }));
+  const n = rows.length;
+  rows[0].distance = 0.0;
+  for (let i = 1; i < n; i++) {
+    rows[i].distance = haversineM(rows[i - 1].lat, rows[i - 1].lon, rows[i].lat, rows[i].lon);
+  }
+  let cum = 0.0;
+  for (const r of rows) { cum += r.distance; r.cum_dist = cum; }
+  for (const r of rows) {
+    r.drainage_area_sqmi = r.drainage_area_km2 * 0.386102;
+    r.formula_width = estimateGeometryPayton(r.drainage_area_sqmi)[0];
+    r.braided = false;
+    // authored corridor width is trusted: no GLOW cap, but keep the same
+    // 51-pt trailing smoothing so breakpoint steps don't kink the velocity
+    r.width_m = r.corridor_width_m;
+    r.width_final_raw = r.corridor_width_m > 0 ? r.corridor_width_m : r.formula_width;
+  }
+  {
+    const W = 51;
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      sum += rows[i].width_final_raw;
+      if (i >= W) sum -= rows[i - W].width_final_raw;
+      rows[i].width_final = sum / Math.min(i + 1, W);
+    }
+  }
+
+  // 4. virtual gauges: entry + exit of each chained corridor, DA-ratio
+  //    transferred from that corridor's flow reference. Feeds the standard
+  //    DA-weighted interpolation — flow jumps land AT the confluence.
+  const CFS_PER_M3S = Math.pow(3.281, 3);
+  const gd = [];
+  const corridorWarnings = [];
+  const flowNotes = [];
+  for (const meta of corridorMeta) {
+    const c = byId.get(meta.id);
+    const f = await corridorFlow(c, cfg.asOf, log);
+    if (!f) {
+      corridorWarnings.push(`${c.name}: no flow data available (gauge feed down, no fallback) — flow assumed from drainage area only.`);
+      continue;
+    }
+    const daRefSqmi = f.daKm2 * 0.386102;
+    const crows = rows.filter((r) => r.corridor_id === meta.id && r.ftype === "Corridor");
+    if (!crows.length) continue;
+    for (const at of [crows[0], crows[crows.length - 1]]) {
+      const daSqmi = at.drainage_area_sqmi;
+      if (!(daSqmi > 0) || !(daRefSqmi > 0)) continue;
+      const q = f.qM3s * CFS_PER_M3S * (daSqmi / daRefSqmi);
+      if (gd.some((g) => Math.abs(g.trace_dist - at.cum_dist) < 1)) continue;
+      const [w, dep] = estimateGeometryPayton(daSqmi);
+      gd.push({
+        station_id: `${meta.id}:${f.source}`,
+        name: `${c.name} (${f.note || f.source})`,
+        lat: at.lat, lon: at.lon,
+        discharge: q, drainage_area: daSqmi,
+        q_source: f.source,
+        area: w * dep, trace_dist: at.cum_dist,
+      });
+    }
+    if (f.source !== "eccc-iv") {
+      corridorWarnings.push(
+        `${c.name}: flow is a HISTORICAL MONTHLY MEDIAN (${f.note || "archived record"}) — NOT live conditions.`);
+    }
+    flowNotes.push(`${c.name}: ${f.qM3s.toFixed(2)} m3/s at ref DA ${Math.round(f.daKm2)} km2 (${f.source})`);
+    for (const wtext of c.warnings || []) {
+      if (!corridorWarnings.includes(wtext)) corridorWarnings.push(wtext);
+    }
+  }
+  gd.sort((a, b) => a.trace_dist - b.trace_dist);
+  for (const g of gd) {
+    log(`  corridor gauge ${g.station_id.padEnd(28)} ${String(Math.round(g.discharge)).padStart(9)} cfs @ ${(g.trace_dist / 1000).toFixed(1).padStart(6)} km (${g.q_source})`);
+  }
+
+  // 5. site/receptor features — identical to the US path
+  const fetchSets = async (providers) => Promise.all(
+    (providers || []).map(async (p) => ({
+      buffer_m: p.buffer_m ?? 400,
+      feats: await p.fetch(),
+    })),
+  );
+  const [siteSets, receptorSets] = await Promise.all(
+    [fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
+  );
+
+  const riverName = corridorMeta.map((m) => byId.get(m.id).name).join(" → ");
+  log(`  corridor trace: ${riverName}, ${n} points, ${(rows[n - 1].cum_dist / 1000).toFixed(1)} km, ${gd.length} virtual gauges`);
+
+  return {
+    lat, lon, comid: null, snapName: corr.name, snapDistM, riverName,
+    rows, gd, siteSets, receptorSets,
+    asOf: cfg.asOf || "live",
+    fetchedAt: new Date().toISOString(),
+    corridorWarnings,
+    corridorMeta: {
+      chain: corridorMeta.map((m) => ({ id: m.id, from_km: Math.round(m.from_km * 100) / 100 })),
+      flow: flowNotes,
+    },
+  };
+}
+
 // ---------------------------------------------------------------- main model
 //
 // Split into two stages so the expensive part is cacheable:
@@ -536,6 +887,21 @@ export async function fetchTraceData(lat, lon, config = {}) {
   const log = cfg.verbose ? (...a) => console.log(...a) : () => {};
 
   log(`fetchTraceData(${lat.toFixed(4)}, ${lon.toFixed(4)})  asOf=${cfg.asOf || "live"}`);
+
+  // 0. corridor mode (v1.6): if the click lands on a configured corridor
+  // (Canadian rivers — no NLDI/NHDPlus/NWIS coverage), run on corridor data.
+  if (cfg.corridors && cfg.corridors.length) {
+    const docs = await loadCorridors(cfg.corridors, log);
+    let best = null;
+    for (const c of docs) {
+      const { distM } = nearestCorridorVertex(lat, lon, c);
+      if (distM <= (c.snap_m || 500) && (!best || distM < best.distM)) best = { c, distM };
+    }
+    if (best) {
+      log(`  corridor match: ${best.c.id} (${Math.round(best.distM)} m from centerline)`);
+      return fetchCorridorTraceData(lat, lon, best.c, docs, cfg, log);
+    }
+  }
 
   // 1. trace geometry (one NLDI call) + VAA batch join
   const [comid, snapName, snapD] = await snapComid(lat, lon, cfg.minStreamOrder);
@@ -812,12 +1178,15 @@ export function computeTrace(data, config = {}) {
     }
   }
 
-  // 4. Manning's depth per point (formula fallback), V = Q/A, safety factor
+  // 4. Manning's depth per point (formula fallback), V = Q/A, safety factor.
+  // Corridor rows may carry an authored depth_override (surveyed/charted
+  // depth — e.g. tidal reaches where an energy slope is meaningless).
   const CFS_TO_M3S = Math.pow(3.281, 3);
   let ok = 0;
   for (const r of rows) {
     r.Q_m3s = r.Q_cfs / CFS_TO_M3S;
     const depthFormula = estimateGeometryPayton(r.drainage_area_sqmi)[1];
+    if (r.depth_override > 0) { r.depth = r.depth_override; ok++; r.area = r.width_final * r.depth; r.velocity = (r.Q_m3s / r.area) * cfg.safetyFactor; continue; }
     const dm = calculateDepthManning(r.Q_m3s, r.width_final, r.slope, cfg.manningN);
     if (dm !== null && dm > 0.1 && dm < 20) { r.depth = dm; ok++; }
     else r.depth = depthFormula;
@@ -877,6 +1246,21 @@ export function computeTrace(data, config = {}) {
   }
   if (jobson && jobsonDegraded) log(`  Jobson: ${jobsonDegraded} points lacked EROM Qa (hydraulic fallback)`);
   const timeOf = (r) => (jobson ? r.t_lead : r.cum_time);
+  // where + when the plume enters the impoundment — seeds the open-water
+  // continuation (v1.7). Timing fields exist on rows[stopIdx] because df was
+  // sliced from rows (shared references) before the time cutoff below.
+  let impoundStopPoint = null;
+  if (stopIdx !== null) {
+    const sr = rows[stopIdx];
+    const etaStop = timeOf(sr);
+    if (etaStop !== undefined && etaStop < cfg.maxHours) {
+      impoundStopPoint = {
+        lat: sr.lat, lon: sr.lon,
+        eta_hr: Math.round(etaStop * 100) / 100,
+        name: sr.gnis_name || "impoundment",
+      };
+    }
+  }
   df = df.filter((r) => timeOf(r) < cfg.maxHours);
   const maxCumTime = df.length ? timeOf(df[df.length - 1]) : 0;
   const nearestRow = (field, target) => {
@@ -950,6 +1334,12 @@ export function computeTrace(data, config = {}) {
   for (const s of siteSets || []) sites.push(...proximity(s));
   sites.sort((a, b) => a.eta_hr - b.eta_hr);
   const warnings = impoundNote ? [impoundNote] : [];
+  // corridor mode: authored warnings (tidal reach, no-live-gauge, arm splits)
+  // + downgrade confidence when any flow input is a historical median
+  if (gd.some((g) => g.q_source === "monthly-median") && qConfidence === "HIGH") {
+    qConfidence = "MODERATE — includes historical-median flow (no live gauge)";
+  }
+  for (const w of data.corridorWarnings || []) warnings.push(w);
   if (qConfidence !== "HIGH") warnings.unshift(`Flow estimate: ${qConfidence} (${qMethod})`);
   {
     const statG = gd.filter((g) => g.q_source === "stat-p50");
@@ -1002,9 +1392,11 @@ export function computeTrace(data, config = {}) {
     jobson_degraded_points: jobson ? jobsonDegraded : null,
     impound_exclusions_applied: [...excluded].filter((c) => rows.some((r) => r.comid === c)),
     impound_stop_km: stopIdx !== null ? Math.round(rows[stopIdx].cum_dist / 100) / 10 : null,
+    corridor: data.corridorMeta || null,
   };
 
   const result = {
+    mode: "river",
     river_name: riverName,
     comid,
     as_of: data.asOf || "live",
@@ -1019,6 +1411,7 @@ export function computeTrace(data, config = {}) {
     distance_km_24h: distanceKm,
     avg_velocity_mph: avgVel * 2.23694,
     impound_stop: impoundNote,
+    impound_stop_point: impoundStopPoint,
     hourly,
     sites,
     warnings,
@@ -1032,9 +1425,41 @@ export function computeTrace(data, config = {}) {
   return result;
 }
 
+/**
+ * Which model does a click get? 'open-water' when the point sits inside a
+ * lake/reservoir polygon (>= minLakeSqKm) — UNLESS a non-impounded reach is
+ * nearby (dam tailraces sit inside reservoir polygons; that click means the
+ * river below the dam). Returns { mode, waterbody? } — the waterbody is
+ * passed on so the open-water fetch skips a duplicate PIP query.
+ */
+export async function resolveTraceMode(lat, lon, config = {}) {
+  const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  if (!ow.enabled) return { mode: "river" };
+  const wb = await queryWaterbody(lat, lon, config);
+  if (!wb || !isOpenWaterBody(wb) || !(wb.area_sqkm >= ow.minLakeSqKm)) return { mode: "river" };
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  try {
+    if (await nearRiverReach(lat, lon, cfg.minStreamOrder, ow.riverOverrideM)) {
+      return { mode: "river", waterbody: wb };
+    }
+  } catch { /* tiebreak unavailable → open water (the PIP hit stands) */ }
+  return { mode: "open-water", waterbody: wb };
+}
+
 export async function runTrace(lat, lon, config = {}) {
+  const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  const disp = await resolveTraceMode(lat, lon, config);
+  if (disp.mode === "open-water") return runOpenWater(lat, lon, config, disp.waterbody);
   const data = await fetchTraceData(lat, lon, config);
-  return computeTrace(data, config);
+  const result = computeTrace(data, config);
+  if (ow.enabled && ow.continueAtImpoundment && result.impound_stop_point) {
+    try {
+      result.open_water = await runOpenWaterContinuation(result, config);
+    } catch (e) {
+      result.warnings.push(`Open-water continuation unavailable: ${e.message || e}`);
+    }
+  }
+  return result;
 }
 
 /**
@@ -1095,5 +1520,649 @@ export function toGeoJson(result) {
       },
     });
   }
+  if (result.open_water) {
+    fc.features.push(...toOpenWaterGeoJson(result.open_water).features);
+  }
   return fc;
+}
+
+// =========================================================================
+// OPEN-WATER MODE (v1.7) — lakes & reservoirs
+//
+// GNOME-style Lagrangian particle transport (NOAA Tech Doc NOS OR&R 40,
+// public domain; algorithms validated against its closed forms in
+// openwater-spike/test_core.mjs — 18/18). Wind-drift only: for reservoirs
+// with no operational current model this IS accepted responder practice
+// (the "3% of wind toward the downwind shore" rule, done properly with an
+// hourly forecast + minimum-regret uncertainty set).
+//
+// Gotchas honored (spike findings):
+//   1. explicit windage persistence and GNOME's App. C sqrt(persist/dt)
+//      range rescale DOUBLE-COUNT — rescale only when dt > persistence
+//   2. NHD MapServer field names are UPPERCASE (GNIS_NAME, AREASQKM, FTYPE)
+//   3. waterbody query needs maxAllowableOffset (~30 m) or Flathead-size
+//      polygons return thousands of vertices; MultiPolygon rings flattened
+//      (islands beach particles too)
+//   4. refloatHalfLifeHr <= 0 would mean INSTANT refloat — treated as "off"
+// =========================================================================
+
+const NHD_WATERBODY_URL =
+  "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12/query";
+const OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast";
+const M_PER_DEG_LAT = 111120.00024; // GNOME Tech Doc §4
+
+// NHD FType: 390 LakePond, 436 Reservoir (numeric on the MapServer; accept
+// the string forms for robustness)
+export function isOpenWaterBody(wb) {
+  const f = wb && wb.ftype;
+  return f === 390 || f === 436 || f === "LakePond" || f === "Reservoir";
+}
+
+/**
+ * Nearest flowline reach within radiusM (wbareatype included) — dispatch
+ * tiebreak: NHD reservoir polygons extend over dam tailraces, and a click
+ * there means the RIVER below, not the pool (caught live at American Falls:
+ * the reservoir polygon contains the tailrace at 42.7803,-112.8767).
+ */
+async function nearRiverReach(lat, lon, minOrder, radiusM) {
+  const box = radiusM / 111000; // degrees, generous at these latitudes
+  const j = await getJson(GEOSERVER, {
+    data: {
+      service: "WFS", version: "2.0.0", request: "GetFeature",
+      typeName: "wmadata:nhdflowline_network", outputFormat: "application/json",
+      cql_filter:
+        `streamorde >= ${minOrder} AND BBOX(the_geom,` +
+        `${lat - box},${lon - box},${lat + box},${lon + box})`, // lat,lon axis order
+      count: "50",
+    },
+  });
+  // nearest NON-impounded reach: at a dam both the pool's LakePond reach and
+  // the free-flowing reach below are close — any free-flowing reach in radius
+  // means the click is river context (mid-pool has only the LakePond
+  // ArtificialPath nearby). A tributary mouth flipping to river mode is fine:
+  // the trace impound-stops into the lake immediately and continues as
+  // open water anyway.
+  let best = null, bestD = Infinity;
+  for (const f of j.features || []) {
+    const wba = f.properties.wbareatype;
+    if (wba === "LakePond" || wba === "Reservoir") continue;
+    const g = f.geometry;
+    const paths = g.type === "LineString" ? [g.coordinates] : g.coordinates;
+    for (const path of paths)
+      for (const p of path) {
+        const d = haversineM(lat, lon, p[1], p[0]);
+        if (d < bestD) { bestD = d; best = f.properties; }
+      }
+  }
+  if (best === null || bestD > radiusM) return null;
+  return { dist_m: bestD, wbareatype: best.wbareatype ?? null, comid: Number(best.comid) };
+}
+
+/** Containing NHD waterbody at a point, or null. Geometry simplified to ~30 m. */
+export async function queryWaterbody(lat, lon, config = {}) {
+  const j = await getJson(NHD_WATERBODY_URL, {
+    params: {
+      geometry: `${lon},${lat}`,
+      geometryType: "esriGeometryPoint",
+      inSR: "4326",
+      spatialRel: "esriSpatialRelIntersects",
+      outFields: "GNIS_NAME,AREASQKM,FTYPE", // UPPERCASE on this layer
+      returnGeometry: "true",
+      maxAllowableOffset: "0.0003",
+      f: "geojson",
+    },
+  });
+  const f = j.features && j.features[0];
+  if (!f) return null;
+  const rings = f.geometry.type === "Polygon"
+    ? f.geometry.coordinates
+    : f.geometry.coordinates.flat(1); // MultiPolygon → all rings incl. islands
+  return {
+    name: f.properties.GNIS_NAME || "unnamed waterbody",
+    area_sqkm: f.properties.AREASQKM ?? null,
+    ftype: f.properties.FTYPE,
+    rings,
+  };
+}
+
+/** Hourly forecast wind at a point as [{t: ms, u, v}] (10 m, m/s). */
+async function fetchWindSeries(lat, lon, hoursNeeded) {
+  const days = Math.min(16, Math.ceil(hoursNeeded / 24) + 1);
+  const j = await getJson(OPEN_METEO_URL, {
+    params: {
+      latitude: lat.toFixed(4), longitude: lon.toFixed(4),
+      hourly: "wind_speed_10m,wind_direction_10m",
+      wind_speed_unit: "ms", forecast_days: String(days), timezone: "UTC",
+    },
+  });
+  const h = j.hourly;
+  const series = h.time.map((t, i) => {
+    const r = (h.wind_direction_10m[i] * Math.PI) / 180; // meteorological FROM
+    const s = h.wind_speed_10m[i];
+    return { t: Date.parse(t + ":00Z"), u: -s * Math.sin(r), v: -s * Math.cos(r) };
+  });
+  return { series, source: "open-meteo", points: series.length };
+}
+
+function owWindAt(series, tMs) {
+  if (!series.length) return [0, 0];
+  if (tMs <= series[0].t) return [series[0].u, series[0].v];
+  const last = series[series.length - 1];
+  if (tMs >= last.t) return [last.u, last.v];
+  let lo = 0, hi = series.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].t <= tMs) lo = mid; else hi = mid;
+  }
+  const A = series[lo], B = series[hi];
+  const f = (tMs - A.t) / (B.t - A.t);
+  return [A.u + f * (B.u - A.u), A.v + f * (B.v - A.v)];
+}
+
+// seeded RNG (mulberry32 + Box-Muller) — deterministic replays
+function owMakeRng(seed) {
+  let a = seed >>> 0;
+  let spare = null;
+  const next = () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  return {
+    next,
+    uniform: (lo, hi) => lo + (hi - lo) * next(),
+    gaussian() {
+      if (spare !== null) { const v = spare; spare = null; return v; }
+      let u1 = 0;
+      while (u1 === 0) u1 = next();
+      const u2 = next();
+      const r = Math.sqrt(-2 * Math.log(u1));
+      spare = r * Math.sin(2 * Math.PI * u2);
+      return r * Math.cos(2 * Math.PI * u2);
+    },
+  };
+}
+
+function owProjection(lat0, lon0) {
+  const mPerDegLon = M_PER_DEG_LAT * Math.cos((lat0 * Math.PI) / 180);
+  return {
+    toXY: (lat, lon) => [(lon - lon0) * mPerDegLon, (lat - lat0) * M_PER_DEG_LAT],
+    toLatLon: (x, y) => [lat0 + y / M_PER_DEG_LAT, lon0 + x / mPerDegLon],
+  };
+}
+
+function owSegIntersectT(ax, ay, bx, by, cx, cy, dx, dy) {
+  const rx = bx - ax, ry = by - ay, sx = dx - cx, sy = dy - cy;
+  const denom = rx * sy - ry * sx;
+  if (denom === 0) return null;
+  const t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
+  const u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
+  return t >= 0 && t <= 1 && u >= 0 && u <= 1 ? t : null;
+}
+
+/** Uniform grid over shoreline segments; segments remember ring + ordinal so
+ *  beached particles can be clustered into contiguous shoreline arcs. */
+function owShorelineIndex(ringsXY, cellM = 500) {
+  const segs = [], segMeta = [];
+  ringsXY.forEach((ring, ringIdx) => {
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], b = ring[(i + 1) % ring.length];
+      if (a[0] === b[0] && a[1] === b[1]) continue;
+      segs.push([a[0], a[1], b[0], b[1]]);
+      segMeta.push({ ring: ringIdx, ord: i });
+    }
+  });
+  const cells = new Map();
+  const key = (i, j) => i + "," + j;
+  segs.forEach((s, idx) => {
+    const i0 = Math.floor(Math.min(s[0], s[2]) / cellM), i1 = Math.floor(Math.max(s[0], s[2]) / cellM);
+    const j0 = Math.floor(Math.min(s[1], s[3]) / cellM), j1 = Math.floor(Math.max(s[1], s[3]) / cellM);
+    for (let i = i0; i <= i1; i++)
+      for (let j = j0; j <= j1; j++) {
+        const k = key(i, j);
+        let arr = cells.get(k);
+        if (!arr) { arr = []; cells.set(k, arr); }
+        arr.push(idx);
+      }
+  });
+  return { segs, segMeta, cells, cellM, key };
+}
+
+function owFirstCrossing(index, x1, y1, x2, y2) {
+  const { segs, cells, cellM, key } = index;
+  const i0 = Math.floor(Math.min(x1, x2) / cellM), i1 = Math.floor(Math.max(x1, x2) / cellM);
+  const j0 = Math.floor(Math.min(y1, y2) / cellM), j1 = Math.floor(Math.max(y1, y2) / cellM);
+  const seen = new Set();
+  let best = null;
+  for (let i = i0; i <= i1; i++)
+    for (let j = j0; j <= j1; j++) {
+      const arr = cells.get(key(i, j));
+      if (!arr) continue;
+      for (const idx of arr) {
+        if (seen.has(idx)) continue;
+        seen.add(idx);
+        const s = segs[idx];
+        const t = owSegIntersectT(x1, y1, x2, y2, s[0], s[1], s[2], s[3]);
+        if (t !== null && (best === null || t < best.t)) best = { t, idx };
+      }
+    }
+  if (best === null) return null;
+  return {
+    t: best.t, idx: best.idx,
+    x: x1 + best.t * (x2 - x1), y: y1 + best.t * (y2 - y1),
+  };
+}
+
+export function convexHull(pointsXY) {
+  const pts = [...pointsXY].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (pts.length < 3) return pts;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+
+/** Protective/exclusion boom for a shoreline arc (open water — the river
+ *  deflection rule sin(theta)=0.35/v does NOT apply with no persistent
+ *  current). Planning-level: arc length + reserve, 50-ft sticks. */
+export function estimateShorelineBoom(lengthM, opts = {}) {
+  const reservePct = opts.reservePct ?? 20;
+  const anchorSpacingFt = opts.anchorSpacingFt ?? 100;
+  if (!(lengthM > 0)) return null;
+  const boomFt = Math.ceil((lengthM * 3.28084 * (1 + reservePct / 100)) / 50) * 50;
+  return { boom_ft: boomFt, anchors: Math.max(2, Math.ceil(boomFt / anchorSpacingFt) + 1), protective: true };
+}
+
+/** One particle set. Pure + deterministic (seeded). Internal. */
+function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed }) {
+  const rng = owMakeRng(seed);
+  const dt = ow.timestepS;
+  const nSteps = Math.round((ow.durationHr * 3600) / dt);
+  const stepsPerHour = Math.max(1, Math.round(3600 / dt));
+
+  // windage: explicit persistence for dt <= persist (reference range as-is);
+  // per-step draws with the App. C rescaled range only for dt > persist
+  const wMean = (ow.windageMin + ow.windageMax) / 2;
+  let wHalf = (ow.windageMax - ow.windageMin) / 2;
+  let wPersistS = ow.windagePersistS;
+  if (dt > wPersistS) {
+    wHalf *= Math.sqrt(wPersistS / dt);
+    wPersistS = dt;
+  }
+  const drawWindage = () => Math.max(0, wMean + rng.uniform(-wHalf, wHalf));
+  const diffStep = Math.sqrt(6 * ow.diffusionM2s * dt);
+  const angCap = Math.PI / 3; // ±60° cap on wind-angle perturbation (GNOME §15)
+  const pRefloat = ow.refloatHalfLifeHr > 0
+    ? 1 - Math.pow(2, -(dt / 3600) / ow.refloatHalfLifeHr)
+    : 0; // <= 0 disables refloating (NOT "instant")
+
+  const N = ow.nParticles;
+  const P = new Array(N);
+  for (let i = 0; i < N; i++) {
+    P[i] = {
+      x: x0, y: y0, beached: false, lastX: x0, lastY: y0,
+      beachTMs: null, beachSeg: null,
+      windage: drawWindage(), windageAgeS: 0,
+      pertF: 1, pertA: 0, pertAgeS: 0,
+    };
+    if (uncertainty) drawPerturb(P[i]);
+  }
+  function drawPerturb(p) {
+    p.pertF = Math.exp(rng.gaussian() * 0.3); // lognormal speed factor, median 1
+    p.pertA = Math.max(-angCap, Math.min(angCap, (rng.gaussian() * 20 * Math.PI) / 180));
+    p.pertAgeS = 0;
+  }
+
+  const hourly = [];
+  const snapshot = (hr) => {
+    const pos = new Array(N);
+    let cx = 0, cy = 0, nb = 0;
+    for (let i = 0; i < N; i++) {
+      pos[i] = [P[i].x, P[i].y];
+      cx += P[i].x; cy += P[i].y;
+      if (P[i].beached) nb++;
+    }
+    hourly.push({ hr, centroidXY: [cx / N, cy / N], beachedCount: nb, positions: pos });
+  };
+  snapshot(0);
+
+  for (let step = 1; step <= nSteps; step++) {
+    const tMs = tMs0 + (step - 1) * dt * 1000; // forcing at interval start (forward Euler)
+    const [wu0, wv0] = owWindAt(windSeries, tMs);
+    for (let i = 0; i < N; i++) {
+      const p = P[i];
+      if (p.beached) {
+        if (pRefloat > 0 && rng.next() < pRefloat) {
+          p.beached = false; p.x = p.lastX; p.y = p.lastY;
+        } else continue;
+      }
+      p.windageAgeS += dt;
+      if (p.windageAgeS >= wPersistS) { p.windage = drawWindage(); p.windageAgeS = 0; }
+      let wu = wu0, wv = wv0;
+      if (uncertainty) {
+        p.pertAgeS += dt;
+        if (p.pertAgeS >= 10800) drawPerturb(p); // 3 h persistence
+        const c = Math.cos(p.pertA), s = Math.sin(p.pertA);
+        wu = p.pertF * (wu0 * c - wv0 * s);
+        wv = p.pertF * (wu0 * s + wv0 * c);
+      }
+      const nx = p.x + p.windage * wu * dt + rng.uniform(-1, 1) * diffStep;
+      const ny = p.y + p.windage * wv * dt + rng.uniform(-1, 1) * diffStep;
+      if (index) {
+        const hit = owFirstCrossing(index, p.x, p.y, nx, ny);
+        if (hit) {
+          p.lastX = p.x; p.lastY = p.y; // last water position (GNOME §14)
+          const len = Math.hypot(nx - p.x, ny - p.y) || 1;
+          p.x = hit.x - (nx - p.x) / len; // land 1 m short of the crossing
+          p.y = hit.y - (ny - p.y) / len;
+          p.beached = true;
+          p.beachSeg = hit.idx;
+          if (p.beachTMs === null) p.beachTMs = tMs + dt * 1000;
+          continue;
+        }
+      }
+      p.x = nx; p.y = ny;
+    }
+    if (step % stepsPerHour === 0) snapshot(step / stepsPerHour);
+  }
+  return { particles: P, hourly };
+}
+
+/**
+ * fetchOpenWaterData — all network for one open-water run. Waterbody may be
+ * passed pre-fetched (runTrace dispatch already queried it).
+ * startOffsetHr shifts the sim start into the forecast (impoundment
+ * continuations start when the river plume ARRIVES, not now).
+ */
+export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null, startOffsetHr = 0) {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  const wb = waterbody || (await queryWaterbody(lat, lon, config));
+  if (!wb) throw new Error("point is not inside an NHD waterbody");
+  const wind = await fetchWindSeries(lat, lon, startOffsetHr + ow.durationHr);
+  const fetchSets = async (providers) => Promise.all(
+    (providers || []).map(async (p) => ({
+      name: p.name, buffer_m: p.buffer_m ?? 400, feats: await p.fetch(),
+    })),
+  );
+  const [siteSets, receptorSets] = await Promise.all(
+    [fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
+  );
+  return {
+    lat, lon, waterbody: wb,
+    windSeries: wind.series, windSource: wind.source,
+    siteSets, receptorSets,
+    startOffsetHr,
+    startTMs: Date.now() + startOffsetHr * 3600000,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+/** Re-aim cached open-water data at a new start offset (safety-factor
+ *  re-runs move the river ETA into the impoundment — wind + polygon are
+ *  reusable, only the clock shifts). */
+export function rebaseOpenWaterData(data, startOffsetHr) {
+  return { ...data, startOffsetHr, startTMs: Date.now() + startOffsetHr * 3600000 };
+}
+
+const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+const compass = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+
+/** computeOpenWater — pure given data + config (seeded RNG in runRecord). */
+export function computeOpenWater(data, config = {}) {
+  const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  const log = (m) => ({ ...DEFAULT_CONFIG, ...config }).verbose && console.log(m);
+  const t0 = Date.now();
+  const proj = owProjection(data.lat, data.lon);
+  const ringsXY = data.waterbody.rings.map((r) => r.map(([lo, la]) => proj.toXY(la, lo)));
+  const index = owShorelineIndex(ringsXY);
+
+  const simArgs = {
+    x0: 0, y0: 0, tMs0: data.startTMs, windSeries: data.windSeries, index, ow,
+  };
+  const best = owSimulate({ ...simArgs, uncertainty: false, seed: ow.seed });
+  const regret = owSimulate({ ...simArgs, uncertainty: true, seed: ow.seed + 1 });
+
+  const toLatLonRing = (hullXY) =>
+    hullXY.length >= 3 ? [...hullXY, hullXY[0]].map(([x, y]) => {
+      const [la, lo] = proj.toLatLon(x, y);
+      return [Math.round(lo * 1e6) / 1e6, Math.round(la * 1e6) / 1e6];
+    }) : null;
+
+  const hourly = best.hourly.filter((h) => h.hr > 0).map((h) => {
+    const [cla, clo] = proj.toLatLon(...h.centroidXY);
+    return {
+      hour: h.hr,
+      abs_hr: Math.round((data.startOffsetHr + h.hr) * 100) / 100,
+      centroid: { lat: Math.round(cla * 1e6) / 1e6, lon: Math.round(clo * 1e6) / 1e6 },
+      hull: toLatLonRing(convexHull(h.positions)),
+      beached_count: h.beachedCount,
+    };
+  });
+  const uncertaintyHourly = regret.hourly.filter((h) => h.hr > 0).map((h) => ({
+    hour: h.hr, hull: toLatLonRing(convexHull(h.positions)),
+  }));
+
+  // shoreline impacts: cluster beached particles into contiguous shore arcs
+  const { segMeta } = index;
+  const byRing = new Map();
+  for (const p of best.particles) {
+    if (p.beachSeg === null) continue;
+    const m = segMeta[p.beachSeg];
+    let arr = byRing.get(m.ring);
+    if (!arr) { arr = []; byRing.set(m.ring, arr); }
+    arr.push({ ord: m.ord, hr: (p.beachTMs - data.startTMs) / 3600000 });
+  }
+  const impacts = [];
+  for (const [ringIdx, hits] of byRing) {
+    hits.sort((a, b) => a.ord - b.ord);
+    const ring = data.waterbody.rings[ringIdx];
+    let cl = null;
+    const flush = () => { if (cl) { impacts.push(cl); cl = null; } };
+    for (const h of hits) {
+      if (cl && h.ord - cl.maxOrd <= ow.shoreGapSegs) {
+        cl.maxOrd = Math.max(cl.maxOrd, h.ord);
+        cl.hrs.push(h.hr);
+      } else {
+        flush();
+        cl = { ring: ringIdx, minOrd: h.ord, maxOrd: h.ord, hrs: [h.hr] };
+      }
+    }
+    flush();
+    // NOTE: a cluster wrapping a ring's index origin splits in two — cosmetic
+    for (const c of impacts.filter((c) => c.ring === ringIdx && !c.line)) {
+      const pts = [];
+      for (let i = c.minOrd; i <= Math.min(c.maxOrd + 1, ring.length - 1); i++) pts.push(ring[i]);
+      if (pts.length < 2) pts.push(ring[Math.min(c.maxOrd, ring.length - 1)]);
+      let lenM = 0;
+      for (let i = 1; i < pts.length; i++) lenM += haversineM(pts[i - 1][1], pts[i - 1][0], pts[i][1], pts[i][0]);
+      c.hrs.sort((a, b) => a - b);
+      const mid = pts[(pts.length / 2) | 0];
+      c.line = pts.map(([lo, la]) => [Math.round(lo * 1e6) / 1e6, Math.round(la * 1e6) / 1e6]);
+      c.out = {
+        count: c.hrs.length,
+        share_pct: Math.round((1000 * c.hrs.length) / ow.nParticles) / 10,
+        first_hr: Math.round(c.hrs[0] * 10) / 10,
+        first_abs_hr: Math.round((data.startOffsetHr + c.hrs[0]) * 10) / 10,
+        median_hr: Math.round(c.hrs[(c.hrs.length / 2) | 0] * 10) / 10,
+        length_m: Math.round(lenM),
+        center: { lat: mid[1], lon: mid[0] },
+        line: c.line,
+        boom: estimateShorelineBoom(lenM),
+      };
+    }
+  }
+  const shoreImpacts = impacts.map((c) => c.out)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, ow.maxShoreImpacts)
+    .sort((a, b) => a.first_hr - b.first_hr);
+
+  // site ETAs: first hour any best-guess particle comes within the buffer
+  const sites = [];
+  for (const set of data.siteSets || []) {
+    const buf = set.buffer_m ?? 400;
+    for (const f of set.feats || []) {
+      if (f.lat === undefined || f.lon === undefined) continue;
+      const [fx, fy] = proj.toXY(f.lat, f.lon);
+      let eta = null, offset = null;
+      for (const h of best.hourly) {
+        if (h.hr === 0) continue;
+        let dmin = Infinity;
+        for (const [x, y] of h.positions) {
+          const d = Math.hypot(x - fx, y - fy);
+          if (d < dmin) dmin = d;
+        }
+        if (dmin <= buf) { eta = h.hr; offset = Math.round(dmin); break; }
+      }
+      if (eta !== null) {
+        const { lat: _a, lon: _b, ...rest } = f;
+        sites.push({
+          ...rest,
+          eta_hr: Math.round((data.startOffsetHr + eta) * 100) / 100,
+          offset_m: offset,
+          open_water: true,
+        });
+      }
+    }
+  }
+  sites.sort((a, b) => a.eta_hr - b.eta_hr);
+
+  // downwind headline from the first-12h mean wind + earliest arrivals
+  const warnings = [];
+  let headline = null;
+  {
+    let su = 0, sv = 0, n = 0;
+    for (let hr = 0; hr < 12; hr++) {
+      const [u, v] = owWindAt(data.windSeries, data.startTMs + hr * 3600000);
+      su += u; sv += v; n++;
+    }
+    const spd = Math.hypot(su / n, sv / n);
+    const towardDeg = (Math.atan2(su / n, sv / n) * 180) / Math.PI;
+    const bestFirst = shoreImpacts.length ? shoreImpacts[0] : null;
+    const regretTimes = regret.particles.filter((p) => p.beachTMs !== null)
+      .map((p) => (p.beachTMs - data.startTMs) / 3600000).sort((a, b) => a - b);
+    const early = regretTimes.length ? Math.round(regretTimes[0] * 10) / 10 : null;
+    headline =
+      `Wind ${spd.toFixed(1)} m/s → drifting ${compass(towardDeg)}` +
+      (bestFirst
+        ? `; first shoreline arrival ~${early !== null && early < bestFirst.first_hr ? early + "–" : ""}${bestFirst.first_hr} h`
+        : `; no shoreline arrival within ${ow.durationHr} h (best guess)`);
+    if (spd < 1.5) warnings.push(
+      "Light/variable wind — drift direction is LOW CONFIDENCE; treat the uncertainty envelope as the planning footprint.");
+  }
+  warnings.push(
+    "Open-water model: wind-drift surface transport only (GNOME-class physics) — no weathering, no lake-circulation currents; ETAs are forecast-wind dependent.");
+
+  const result = {
+    mode: "open-water",
+    waterbody: { name: data.waterbody.name, area_sqkm: data.waterbody.area_sqkm, ftype: data.waterbody.ftype },
+    spill_point: { lat: data.lat, lon: data.lon },
+    start_offset_hr: data.startOffsetHr,
+    duration_hr: ow.durationHr,
+    headline,
+    hourly,
+    uncertainty_hourly: uncertaintyHourly,
+    shore_impacts: shoreImpacts,
+    sites,
+    warnings,
+    stats: {
+      n_particles: ow.nParticles,
+      beached_final: best.particles.filter((p) => p.beached).length,
+      ever_beached: best.particles.filter((p) => p.beachTMs !== null).length,
+      compute_ms: Date.now() - t0,
+    },
+    runRecord: {
+      engine_version: ENGINE_VERSION,
+      mode: "open-water",
+      generated_at: new Date().toISOString(),
+      data_fetched_at: data.fetchedAt,
+      spill_point: { lat: data.lat, lon: data.lon },
+      waterbody: { name: data.waterbody.name, area_sqkm: data.waterbody.area_sqkm, ftype: data.waterbody.ftype, rings: data.waterbody.rings.length },
+      wind_source: data.windSource,
+      wind_points: data.windSeries.length,
+      start_offset_hr: data.startOffsetHr,
+      seed: ow.seed,
+      params: {
+        n_particles: ow.nParticles, duration_hr: ow.durationHr, timestep_s: ow.timestepS,
+        windage: [ow.windageMin, ow.windageMax], diffusion_m2s: ow.diffusionM2s,
+        refloat_half_life_hr: ow.refloatHalfLifeHr,
+      },
+      shoreline_segments: index.segs.length,
+    },
+  };
+  log(`  OPEN WATER: ${data.waterbody.name} — ${result.stats.ever_beached}/${ow.nParticles} beached, ` +
+    `${shoreImpacts.length} shore impacts, ${sites.length} sites, ${result.stats.compute_ms} ms`);
+  return result;
+}
+
+export async function runOpenWater(lat, lon, config = {}, waterbody = null) {
+  const data = await fetchOpenWaterData(lat, lon, config, waterbody);
+  return computeOpenWater(data, config);
+}
+
+/** River trace ended at an impoundment → continue as open water from the
+ *  entry point, clock offset by the river ETA. */
+export async function runOpenWaterContinuation(riverResult, config = {}) {
+  const sp = riverResult.impound_stop_point;
+  if (!sp) return null;
+  const data = await fetchOpenWaterData(sp.lat, sp.lon, config, null, sp.eta_hr);
+  const owRes = computeOpenWater(data, config);
+  owRes.continuation_of = {
+    river: riverResult.river_name,
+    entered: sp.name,
+    river_eta_hr: sp.eta_hr,
+  };
+  owRes.warnings.unshift(
+    `Continuation: river plume enters ${sp.name} at ~${sp.eta_hr} h; open-water hours below are ABSOLUTE from the spill (abs_hr).`);
+  return owRes;
+}
+
+/** Open-water result as GeoJSON (hulls, centroid track, shore impacts). */
+export function toOpenWaterGeoJson(ow) {
+  const features = [{
+    type: "Feature",
+    properties: { kind: "ow_spill_point", waterbody: ow.waterbody.name, headline: ow.headline },
+    geometry: { type: "Point", coordinates: [ow.spill_point.lon, ow.spill_point.lat] },
+  }];
+  features.push({
+    type: "Feature",
+    properties: { kind: "ow_centroid_track" },
+    geometry: { type: "LineString", coordinates: ow.hourly.map((h) => [h.centroid.lon, h.centroid.lat]) },
+  });
+  for (const h of ow.hourly) {
+    if (h.hull) features.push({
+      type: "Feature",
+      properties: { kind: "ow_hull", hour: h.hour, abs_hr: h.abs_hr, beached_count: h.beached_count },
+      geometry: { type: "Polygon", coordinates: [h.hull] },
+    });
+  }
+  for (const h of ow.uncertainty_hourly) {
+    if (h.hull) features.push({
+      type: "Feature",
+      properties: { kind: "ow_uncertainty_hull", hour: h.hour },
+      geometry: { type: "Polygon", coordinates: [h.hull] },
+    });
+  }
+  for (const s of ow.shore_impacts) {
+    features.push({
+      type: "Feature",
+      properties: {
+        kind: "ow_shore_impact", first_hr: s.first_hr, median_hr: s.median_hr,
+        share_pct: s.share_pct, length_m: s.length_m, boom_ft: s.boom ? s.boom.boom_ft : null,
+      },
+      geometry: { type: "LineString", coordinates: s.line },
+    });
+  }
+  return { type: "FeatureCollection", features };
 }

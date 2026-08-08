@@ -110,7 +110,7 @@
     view.when(() => {
       map.add(gfx);
       $("armBtn").disabled = false;
-      $("status").textContent = 'Click "Set spill point", then click the river.';
+      $("status").textContent = 'Click "Set spill point", then click the water (river, lake, or reservoir).';
     });
 
     // ---- ETA color bands ----
@@ -258,6 +258,160 @@
       }
     }
 
+    // ---- open-water mode (engine v1.7: lakes/reservoirs, GNOME-class) ----
+    const hexRgbA = (x, a) => [parseInt(x.slice(1, 3), 16), parseInt(x.slice(3, 5), 16), parseInt(x.slice(5, 7), 16), a];
+
+    // which hourly hulls to draw (all 24 would be visual mud)
+    const hullHours = (ow) => {
+      const avail = ow.hourly.map((h) => h.hour);
+      const want = [3, 6, 12, ow.duration_hr].filter((h) => avail.includes(h));
+      if (!want.length && avail.length) want.push(avail[avail.length - 1]);
+      return want;
+    };
+
+    function drawOpenWater(ow, { append = false } = {}) {
+      if (!append) gfx.removeAll();
+      const absHr = (h) => (ow.start_offset_hr || 0) + h;
+      // uncertainty envelope: final-hour minimum-regret hull, dashed grey under everything
+      const lastU = ow.uncertainty_hourly[ow.uncertainty_hourly.length - 1];
+      if (lastU && lastU.hull) {
+        gfx.add(new Graphic({
+          geometry: { type: "polygon", rings: [lastU.hull], spatialReference: { wkid: 4326 } },
+          symbol: { type: "simple-fill", color: [120, 120, 120, 0.08],
+                    outline: { color: [90, 90, 90, 0.8], width: 1.5, style: "dash" } },
+          popupTemplate: { title: "Uncertainty envelope", content:
+            `Minimum-regret footprint at hour ${lastU.hour} — plan to this outline, not the best guess.` },
+        }));
+      }
+      // best-guess hulls, latest first so early (small) hulls stay clickable on top
+      const hrs = hullHours(ow);
+      for (const hr of [...hrs].reverse()) {
+        const h = ow.hourly.find((x) => x.hour === hr);
+        if (!h || !h.hull) continue;
+        const c = bandColor(absHr(hr));
+        gfx.add(new Graphic({
+          geometry: { type: "polygon", rings: [h.hull], spatialReference: { wkid: 4326 } },
+          symbol: { type: "simple-fill", color: hexRgbA(c, 0.15), outline: { color: c, width: 2 } },
+          popupTemplate: { title: `Hour ${absHr(hr)}${ow.start_offset_hr ? " (absolute from spill)" : ""}`,
+            content: `Best-guess plume footprint · ${h.beached_count}/${ow.stats.n_particles} particles ashore` },
+        }));
+      }
+      // centroid drift track + hour labels at the drawn hulls
+      if (ow.hourly.length > 1) {
+        gfx.add(new Graphic({
+          geometry: new Polyline({ paths: [ow.hourly.map((h) => [h.centroid.lon, h.centroid.lat])],
+                                   spatialReference: { wkid: 4326 } }),
+          symbol: { type: "simple-line", color: [40, 40, 40, 0.9], width: 2, style: "short-dot" },
+        }));
+        for (const hr of hrs) {
+          const h = ow.hourly.find((x) => x.hour === hr);
+          if (!h) continue;
+          gfx.add(new Graphic({
+            geometry: new Point({ latitude: h.centroid.lat, longitude: h.centroid.lon }),
+            symbol: { type: "text", text: `${absHr(hr)} hr`, color: bandColor(absHr(hr)),
+                      haloColor: "#ffffff", haloSize: 1.5, yoffset: 8,
+                      font: { size: 10, weight: "bold", family: "sans-serif" } },
+          }));
+        }
+      }
+      // shoreline impacts — the actionable output
+      for (const s of ow.shore_impacts) {
+        const c = bandColor(s.first_abs_hr ?? s.first_hr);
+        gfx.add(new Graphic({
+          geometry: new Polyline({ paths: [s.line], spatialReference: { wkid: 4326 } }),
+          symbol: { type: "simple-line", color: c, width: 6, cap: "round" },
+          popupTemplate: { title: `Shoreline impact — first arrival ~${s.first_abs_hr ?? s.first_hr} hr`, content:
+            `${s.share_pct}% of spill (${s.count} particles) · median arrival ${s.median_hr} hr · ` +
+            `${(s.length_m / 1000).toFixed(1)} km of shore` +
+            (s.boom ? ` · protective boom ~${s.boom.boom_ft.toLocaleString()} ft (${s.boom.anchors} anchor sets)` : "") },
+        }));
+      }
+      // entry/spill point
+      gfx.add(new Graphic({
+        geometry: new Point({ latitude: ow.spill_point.lat, longitude: ow.spill_point.lon }),
+        symbol: { type: "simple-marker", style: "x", size: 14, outline: { color: "#000", width: 3 } },
+        popupTemplate: { title: append ? "Water entry point" : "Spill point",
+          content: `${ow.spill_point.lat.toFixed(5)}, ${ow.spill_point.lon.toFixed(5)}` +
+                   (ow.start_offset_hr ? ` · river plume arrives ~${ow.start_offset_hr} hr` : "") },
+      }));
+    }
+
+    function openWaterTablesHtml(ow) {
+      let html = "";
+      if (ow.shore_impacts.length) {
+        html += "<table><thead><tr><th>First arrival</th><th>Shore</th><th>%</th><th>Boom (protective)</th></tr></thead><tbody>";
+        for (const s of ow.shore_impacts) {
+          const hr = s.first_abs_hr ?? s.first_hr;
+          html += `<tr><td><span class="dot" style="background:${bandColor(hr)}"></span>${hr} hr</td>` +
+            `<td>${(s.length_m / 1000).toFixed(1)} km</td><td>${s.share_pct}%</td>` +
+            `<td>${s.boom ? s.boom.boom_ft.toLocaleString() + " ft" : "—"}</td></tr>`;
+        }
+        html += "</tbody></table>";
+      } else {
+        html += `<div class="dim">No shoreline arrival within ${ow.duration_hr} h (best guess) — watch the uncertainty envelope.</div>`;
+      }
+      if (ow.sites.length) {
+        html += "<table style='margin-top:6px'><thead><tr><th>ETA</th><th>Site</th></tr></thead><tbody>";
+        for (const s of ow.sites) {
+          html += `<tr><td><span class="dot" style="background:${bandColor(s.eta_hr)}"></span>${s.eta_hr.toFixed(1)} hr</td>` +
+            `<td class="sitecol">${s.name ?? ""}</td></tr>`;
+        }
+        html += "</tbody></table>";
+      }
+      return html;
+    }
+
+    function renderOpenWaterResults(ow) {
+      const w = $("warnings");
+      if (ow.warnings.length) {
+        w.style.display = "block";
+        w.innerHTML = ow.warnings.map((x) => `<div>&#9888; ${x}</div>`).join("");
+      } else { w.style.display = "none"; }
+      $("note").innerHTML = `<b>${ow.headline}</b>`;
+      $("results").innerHTML = openWaterTablesHtml(ow);
+      $("legendNote").textContent =
+        "Filled outlines = best-guess plume at the labeled hours · dashed grey = minimum-regret envelope (plan to this) · " +
+        "thick shore lines = predicted shoreline impacts · protective boom = shore length +20%, 50-ft sticks.";
+    }
+
+    // continuation: river trace ended in a reservoir → keep going as open water.
+    // Wind + lake polygon are cached per stop point; SF re-runs only shift the clock.
+    let owContCache = null; // { key, data }
+    const owConfig = () => Object.assign({ verbose: false },
+      { openWater: CFG.openWater || {} });
+    async function continuationFor(res) {
+      const sp = res.impound_stop_point;
+      const key = `${sp.lat.toFixed(4)},${sp.lon.toFixed(4)}`;
+      if (!owContCache || owContCache.key !== key) {
+        // reuse the river run's already-fetched site features (no second layer query)
+        const cachedProviders = (cache.data.siteSets || []).map((s) => ({
+          name: s.name, buffer_m: s.buffer_m, fetch: async () => s.feats,
+        }));
+        const data = await engine.fetchOpenWaterData(
+          sp.lat, sp.lon,
+          Object.assign(owConfig(), { siteProviders: cachedProviders }),
+          null, sp.eta_hr);
+        owContCache = { key, data };
+      }
+      const ow = engine.computeOpenWater(
+        engine.rebaseOpenWaterData(owContCache.data, sp.eta_hr), owConfig());
+      ow.continuation_of = { river: res.river_name, entered: sp.name, river_eta_hr: sp.eta_hr };
+      ow.warnings.unshift(
+        `Continuation: river plume enters ${sp.name} at ~${sp.eta_hr} h — open-water hours are ABSOLUTE from the spill.`);
+      return ow;
+    }
+
+    function appendContinuationPanel(ow) {
+      const w = $("warnings");
+      const existing = w.style.display === "block" ? w.innerHTML : "";
+      w.style.display = "block";
+      w.innerHTML = existing + ow.warnings.map((x) => `<div>&#9888; ${x}</div>`).join("");
+      $("results").innerHTML +=
+        `<div style="margin-top:10px;padding-top:6px;border-top:2px solid #ccc">` +
+        `<b>Into ${ow.waterbody.name} (open water)</b><div>${ow.headline}</div>` +
+        openWaterTablesHtml(ow) + `</div>`;
+    }
+
     // ---- results panel ----
     function renderResults(res) {
       const sites = res.sites || [];
@@ -338,6 +492,22 @@
       $("status").textContent =
         `${res.river_name || "Trace"} — ${res.distance_km_24h.toFixed(1)} km in ≤ ${CFG.maxHours ?? 24} h` +
         (fromCache ? " · recomputed instantly from cached hydrology" : "");
+      // reservoir continuation (async — river result is already on screen)
+      if (res.impound_stop_point && (CFG.openWater?.continueAtImpoundment ?? true)) {
+        $("status").textContent += ` · modeling ${res.impound_stop_point.name}…`;
+        continuationFor(res).then((ow) => {
+          if (lastResult !== res) return; // superseded by a newer run
+          res.open_water = ow;
+          drawOpenWater(ow, { append: true });
+          appendContinuationPanel(ow);
+          $("status").textContent = $("status").textContent.replace(/ · modeling .*$/,
+            ` · continues into ${ow.waterbody.name}`);
+        }).catch((e) => {
+          if (lastResult !== res) return;
+          $("status").textContent = $("status").textContent.replace(/ · modeling .*$/,
+            ` · continuation unavailable (${String(e).slice(0, 60)})`);
+        });
+      }
     }
 
     async function runAt(lat, lon) {
@@ -350,6 +520,30 @@
         try {
           const siteLayers = CFG.siteLayers || [];
           if (!siteLayers.length) notes.push("No site layers configured in this page's config.");
+          // v1.7 dispatch: a click inside a lake/reservoir runs the open-water
+          // particle model (dam tailraces still route to the river)
+          const disp = await engine.resolveTraceMode(lat, lon, Object.assign(modelCfg(1), owConfig()));
+          if (disp.mode === "open-water") {
+            $("status").textContent = `Open water (${disp.waterbody.name}) — running wind-drift particle model…`;
+            const owData = await engine.fetchOpenWaterData(lat, lon, Object.assign(owConfig(), {
+              siteProviders: siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
+            }), disp.waterbody);
+            const res = engine.computeOpenWater(owData, owConfig());
+            cache = { lat, lon, mode: "open-water", owData, fetchNotes: notes.slice() };
+            drawOpenWater(res);
+            renderOpenWaterResults(res);
+            lastResult = res;
+            $("recordBtn").disabled = false;
+            gfx.visible = true;
+            $("hideBtn").disabled = false;
+            $("hideBtn").textContent = "👁 Hide";
+            $("diag").innerHTML = notes.concat([
+              `${res.stats.n_particles} particles · ${res.runRecord.shoreline_segments} shoreline segments · ${res.stats.compute_ms} ms`,
+            ]).map((d) => `<div>${d}</div>`).join("");
+            $("status").textContent =
+              `${disp.waterbody.name} — open-water drift, ${res.duration_hr} h · ${res.shore_impacts.length} shoreline impact(s)`;
+            return;
+          }
           const data = await engine.fetchTraceData(lat, lon, Object.assign(modelCfg(parseFloat($("sfSel").value)), {
             widthProvider: makeWidthProvider(),
             siteProviders: siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
@@ -406,12 +600,20 @@
       if (clickHandle) { clickHandle.remove(); clickHandle = null; $("armBtn").textContent = "Set spill point"; }
       gfx.removeAll();
       cache = null;
+      owContCache = null;
       $("results").innerHTML = ""; $("warnings").style.display = "none";
       $("note").textContent = ""; $("diag").innerHTML = ""; $("legendNote").textContent = "";
       $("status").textContent = 'Cleared. Click "Set spill point" to run again.';
     };
 
-    $("sfSel").onchange = () => { if (cache && !running) computeAndRender(parseFloat($("sfSel").value), true); };
+    $("sfSel").onchange = () => {
+      if (!cache || running) return;
+      if (cache.mode === "open-water") {
+        $("status").textContent = "Safety factor does not apply to open-water (wind-drift) runs — uncertainty is shown as the dashed envelope.";
+        return;
+      }
+      computeAndRender(parseFloat($("sfSel").value), true);
+    };
     $("hideBtn").onclick = () => {
       gfx.visible = !gfx.visible;
       $("hideBtn").textContent = gfx.visible ? "👁 Hide" : "👁 Show";
