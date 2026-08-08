@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.7.0";
+export const ENGINE_VERSION = "1.8.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -94,6 +94,12 @@ export const DEFAULT_OPENWATER = {
   shoreGapSegs: 3,            // beached-cluster merge tolerance (shoreline segments)
   maxShoreImpacts: 10,
   seed: 12345,                // deterministic replays; runRecord carries it
+  // coastal (Tier 3): estuary/sound clicks blend CO-OPS tidal-current
+  // predictions from the nearest stations into the advection
+  coastalCurrents: true,
+  currentStationsMax: 3,
+  currentStationMaxKm: 15,
+  coastalDiffusionM2s: 10,    // GNOME coastal default (lakes stay at 1)
 };
 
 // ---------------------------------------------------------------- helpers
@@ -705,6 +711,101 @@ async function corridorFlow(corr, asOf, log) {
   return median; // unknown provider — best effort
 }
 
+// ---- tidal corridor support (v1.8, Tier 2) ----------------------------------
+//
+// A corridor may carry a `tidal` block:
+//   { from_km, provider: 'iwls-wlp-slope', station_code, station_name,
+//     u_max_ms, phase_lag_min, phase_uncert_min, note }
+// The predicted water-level curve at the station is differentiated to a
+// normalized signed tide signal T(t) in [-1,1]; along-channel tidal velocity
+// is u(t) = -u_max·T(t) (rising level = flood = upstream = negative). This is
+// the standing-wave assumption — `phase_lag_min` shifts it for progressive
+// reaches, and `phase_uncert_min` feeds the earliest-credible envelope run.
+// Amplitude is AUTHORED (warned): tides are deterministic, the amplitude is
+// the calibration knob.
+
+const IWLS_API = "https://api-iwls.dfo-mpo.gc.ca/api/v1";
+
+async function fetchIwlsTidalSeries(tidalCfg, asOf, maxHours, log) {
+  const sts = await getJson(`${IWLS_API}/stations`, {
+    params: { code: tidalCfg.station_code }, timeoutMs: 30000,
+  });
+  if (!Array.isArray(sts) || !sts.length) throw new Error(`IWLS station ${tidalCfg.station_code} not found`);
+  const st = sts[0];
+  const t0Ms = asOf ? Date.parse(asOf + "T00:00:00Z") : Date.now();
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d+Z/, "Z");
+  const raw = await getJson(`${IWLS_API}/stations/${st.id}/data`, {
+    params: {
+      "time-series-code": "wlp",
+      from: iso(t0Ms - 3 * 3600e3),
+      to: iso(t0Ms + (2 * maxHours + 12) * 3600e3),
+    },
+    timeoutMs: 45000,
+  });
+  if (!Array.isArray(raw) || raw.length < 20) throw new Error("IWLS wlp series empty");
+
+  // resample to 15-min buckets, central-difference slope, normalize to [-1,1]
+  const BUCKET = 900e3;
+  const buckets = new Map();
+  for (const r of raw) {
+    const t = Date.parse(r.eventDate);
+    const k = Math.round(t / BUCKET);
+    if (!buckets.has(k)) buckets.set(k, Number(r.value));
+  }
+  const ks = [...buckets.keys()].sort((a, b) => a - b);
+  const slopes = [];
+  for (let i = 1; i < ks.length - 1; i++) {
+    if (ks[i + 1] - ks[i - 1] !== 2) continue; // gap — skip
+    slopes.push({ t: ks[i] * BUCKET, s: (buckets.get(ks[i + 1]) - buckets.get(ks[i - 1])) / (2 * 900) });
+  }
+  if (slopes.length < 10) throw new Error("IWLS series too gappy for slope");
+  const maxAbs = Math.max(...slopes.map((x) => Math.abs(x.s)));
+  if (!(maxAbs > 0)) throw new Error("IWLS series is flat");
+  const lagMs = (tidalCfg.phase_lag_min || 0) * 60e3;
+  const uMax = tidalCfg.u_max_ms;
+  // series value = along-channel tidal velocity (+downstream); T(t)=slope(t+lag)
+  const series = slopes.map((x) => ({ t: x.t - lagMs, u: -uMax * (x.s / maxAbs), v: 0 }));
+  log(`  tidal: IWLS ${tidalCfg.station_code} ${st.officialName} — ${series.length} pts, u_max ${uMax} m/s, lag ${tidalCfg.phase_lag_min || 0} min`);
+  return {
+    series,
+    t0Ms,
+    station_code: tidalCfg.station_code,
+    station_name: tidalCfg.station_name || st.officialName,
+    u_max_ms: uMax,
+    phase_lag_min: tidalCfg.phase_lag_min || 0,
+    phase_uncert_min: tidalCfg.phase_uncert_min ?? 60,
+    from_km: tidalCfg.from_km ?? 0,
+    source: tidalCfg.provider || "iwls-wlp-slope",
+    note: tidalCfg.note || null,
+  };
+}
+
+/**
+ * 1-D leading-edge front through tidal rows: s' = vNet(s) + uTide(t), floored
+ * at the head of tide (flood can push the front back, not above the tidal
+ * zone). Returns FIRST-PASSAGE hours per df index (Infinity = never reached
+ * within maxHours) — first-passage is monotonic in distance, so hourly
+ * markers and site ETAs stay well-defined. Exported for unit tests.
+ *
+ *   vNetAt(s): net downstream velocity (m/s) at trace distance s (meters)
+ *   uTideAt(hr): along-channel tidal velocity (+downstream) at sim-hour hr
+ */
+export function tidalFrontTimes(df, i0, entryHr, vNetAt, uTideAt, maxHours, dtS = 300) {
+  const n = df.length;
+  const times = new Array(n).fill(null);
+  const sStart = i0 > 0 ? df[i0 - 1].cum_dist : 0;
+  let s = sStart;
+  let j = i0;
+  const tEnd = maxHours * 3600;
+  for (let t = entryHr * 3600; t <= tEnd && j < n; t += dtS) {
+    const v = vNetAt(s) + uTideAt(t / 3600);
+    s = Math.max(sStart, s + v * dtS);
+    while (j < n && s >= df[j].cum_dist) { times[j] = (t + dtS) / 3600; j++; }
+  }
+  for (let k = i0; k < n; k++) if (times[k] === null) times[k] = Infinity;
+  return times;
+}
+
 /**
  * Corridor-mode fetchTraceData: rows + virtual gauges from corridor docs.
  * Mirrors the US path's output shape exactly, so computeTrace is unchanged.
@@ -857,9 +958,24 @@ async function fetchCorridorTraceData(lat, lon, corr, allCorridors, cfg, log) {
   const riverName = corridorMeta.map((m) => byId.get(m.id).name).join(" → ");
   log(`  corridor trace: ${riverName}, ${n} points, ${(rows[n - 1].cum_dist / 1000).toFixed(1)} km, ${gd.length} virtual gauges`);
 
+  // 6. tidal series (v1.8) — first corridor in the chain with a tidal block.
+  // Failure degrades to steady net-drift timing with the legacy warning.
+  let tidal = null;
+  const tidalCorr = corridorMeta.map((m) => byId.get(m.id)).find((c) => c.tidal && c.tidal.station_code);
+  if (tidalCorr) {
+    try {
+      tidal = await fetchIwlsTidalSeries(tidalCorr.tidal, cfg.asOf || null, cfg.maxHours, log);
+    } catch (e) {
+      corridorWarnings.push(
+        `Tide feed unavailable (${String(e).slice(0, 70)}) — tidal reach ETAs are NET-DRIFT ONLY; ` +
+        `flood tides can stall or reverse transport, treat as bands of ± several hours.`);
+      log(`  tidal fetch FAILED: ${e}`);
+    }
+  }
+
   return {
     lat, lon, comid: null, snapName: corr.name, snapDistM, riverName,
-    rows, gd, siteSets, receptorSets,
+    rows, gd, siteSets, receptorSets, tidal,
     asOf: cfg.asOf || "live",
     fetchedAt: new Date().toISOString(),
     corridorWarnings,
@@ -1246,6 +1362,65 @@ export function computeTrace(data, config = {}) {
   }
   if (jobson && jobsonDegraded) log(`  Jobson: ${jobsonDegraded} points lacked EROM Qa (hydraulic fallback)`);
   const timeOf = (r) => (jobson ? r.t_lead : r.cum_time);
+
+  // 6b. tidal corridor override (v1.8): rows flagged tidal get FIRST-PASSAGE
+  // times from a 1-D oscillating front (net drift + predicted tide) instead of
+  // steady integration. Net velocity comes from the steady time GRADIENT, so
+  // it inherits safety-factor/Jobson semantics for either timing model.
+  let tidalApplied = null;
+  if (data.tidal && data.tidal.series.length) {
+    const i0 = df.findIndex((r) => r.tidal);
+    if (i0 !== -1 && df.length > 1) {
+      const td = data.tidal;
+      const gradVel = (tField) => {
+        const dist = df.map((r) => r.cum_dist);
+        const segV = new Array(df.length).fill(0.1);
+        for (let i = 1; i < df.length; i++) {
+          const dt = (df[i][tField] - df[i - 1][tField]) * 3600;
+          segV[i] = dt > 0 ? df[i].distance / dt : segV[i - 1];
+        }
+        segV[0] = segV[1] ?? 0.1;
+        return (s) => {
+          if (s <= dist[0]) return segV[0];
+          if (s >= dist[dist.length - 1]) return segV[segV.length - 1];
+          let lo = 0, hi = dist.length - 1;
+          while (hi - lo > 1) { const m = (lo + hi) >> 1; if (dist[m] <= s) lo = m; else hi = m; }
+          return segV[lo + 1];
+        };
+      };
+      const uAt = (shiftMin, scale) => (hr) => {
+        const [u] = owWindAt(td.series, td.t0Ms + (hr * 60 + shiftMin) * 60e3);
+        return u * scale;
+      };
+      const tMain = jobson ? "t_lead" : "cum_time";
+      const entryHr = i0 > 0 ? df[i0 - 1][tMain] : 0;
+      const times = tidalFrontTimes(df, i0, entryHr, gradVel(tMain), uAt(0, 1), cfg.maxHours);
+      // earliest-credible envelope: tide phase advanced by the authored
+      // uncertainty + 10% amplitude, entered at the fast river time
+      const entryFastHr = i0 > 0 ? (jobson ? df[i0 - 1].t_lead_min : df[i0 - 1].cum_time) : 0;
+      const vFast = jobson ? gradVel("t_lead_min") : gradVel("cum_time");
+      const timesFast = tidalFrontTimes(df, i0, entryFastHr, vFast, uAt(td.phase_uncert_min, 1.1), cfg.maxHours);
+      for (let k = i0; k < df.length; k++) {
+        df[k].cum_time = times[k];
+        if (jobson) {
+          df[k].t_peak = times[k];
+          df[k].t_lead = times[k];
+          df[k].t_lead_min = Math.min(timesFast[k], times[k]);
+          df[k].t_clear = null; // Jobson passage regressions don't apply to tidal reaches
+        }
+      }
+      tidalApplied = {
+        station_code: td.station_code, station_name: td.station_name,
+        u_max_ms: td.u_max_ms, phase_lag_min: td.phase_lag_min,
+        phase_uncert_min: td.phase_uncert_min, source: td.source,
+        tide_points: td.series.length, entry_hr: Math.round(entryHr * 100) / 100,
+        rows_tidal: df.length - i0,
+      };
+      log(`  TIDAL: front integration from row ${i0} (entry ${entryHr.toFixed(2)} h), ` +
+        `${td.station_name} u_max ${td.u_max_ms} m/s`);
+    }
+  }
+
   // where + when the plume enters the impoundment — seeds the open-water
   // continuation (v1.7). Timing fields exist on rows[stopIdx] because df was
   // sliced from rows (shared references) before the time cutoff below.
@@ -1334,6 +1509,12 @@ export function computeTrace(data, config = {}) {
   for (const s of siteSets || []) sites.push(...proximity(s));
   sites.sort((a, b) => a.eta_hr - b.eta_hr);
   const warnings = impoundNote ? [impoundNote] : [];
+  if (tidalApplied) {
+    warnings.unshift(
+      `Tidal reach MODELED with predicted tide at ${tidalApplied.station_name} ` +
+      `(authored amplitude ${tidalApplied.u_max_ms} m/s): ETAs are FIRST ARRIVAL of an oscillating ` +
+      `front — product re-crosses sites on later cycles; phase uncertainty ±${tidalApplied.phase_uncert_min} min.`);
+  }
   // corridor mode: authored warnings (tidal reach, no-live-gauge, arm splits)
   // + downgrade confidence when any flow input is a historical median
   if (gd.some((g) => g.q_source === "monthly-median") && qConfidence === "HIGH") {
@@ -1393,6 +1574,7 @@ export function computeTrace(data, config = {}) {
     impound_exclusions_applied: [...excluded].filter((c) => rows.some((r) => r.comid === c)),
     impound_stop_km: stopIdx !== null ? Math.round(rows[stopIdx].cum_dist / 100) / 10 : null,
     corridor: data.corridorMeta || null,
+    tidal: tidalApplied,
   };
 
   const result = {
@@ -1551,11 +1733,17 @@ const NHD_WATERBODY_URL =
 const OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast";
 const M_PER_DEG_LAT = 111120.00024; // GNOME Tech Doc §4
 
-// NHD FType: 390 LakePond, 436 Reservoir (numeric on the MapServer; accept
-// the string forms for robustness)
+// NHD FType: 390 LakePond, 436 Reservoir, 493 Estuary, 445 SeaOcean (numeric
+// on the MapServer; accept the string forms for robustness). Estuary/SeaOcean
+// = coastal — the particle model adds a blended tidal-current field (Tier 3).
 export function isOpenWaterBody(wb) {
   const f = wb && wb.ftype;
-  return f === 390 || f === 436 || f === "LakePond" || f === "Reservoir";
+  return f === 390 || f === 436 || f === 493 || f === 445 ||
+    f === "LakePond" || f === "Reservoir" || f === "Estuary" || f === "SeaOcean";
+}
+export function isCoastalBody(wb) {
+  const f = wb && wb.ftype;
+  return f === 493 || f === 445 || f === "Estuary" || f === "SeaOcean";
 }
 
 /**
@@ -1623,6 +1811,70 @@ export async function queryWaterbody(lat, lon, config = {}) {
     ftype: f.properties.FTYPE,
     rings,
   };
+}
+
+// ---- CO-OPS tidal-current predictions (Tier 3 coastal) ----------------------
+
+const COOPS_DATA_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
+const COOPS_MDAPI_URL = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json";
+let COOPS_CATALOG = null; // module cache — ~4,400 stations, fetched once per session
+
+/**
+ * Nearest CO-OPS current-prediction stations with their signed 6-min series
+ * projected onto flood/ebb axes → [{id, name, lat, lon, dist_km,
+ * series: [{t, u, v}] (m/s true-vector)}]. Tries nearest candidates until
+ * `maxN` succeed (subordinate stations reject 6-min interval — skipped).
+ */
+export async function fetchCurrentStations(lat, lon, ow, hoursNeeded, startTMs, log) {
+  if (!COOPS_CATALOG) {
+    const j = await getJson(COOPS_MDAPI_URL, { params: { type: "currentpredictions", units: "metric" }, timeoutMs: 60000 });
+    // the catalog lists one row per bin/depth — dedupe to one per station id
+    const seen = new Set();
+    COOPS_CATALOG = [];
+    for (const s of j.stations || []) {
+      if (seen.has(s.id)) continue;
+      seen.add(s.id);
+      COOPS_CATALOG.push({ id: s.id, name: s.name, lat: s.lat, lon: s.lng });
+    }
+  }
+  const cands = COOPS_CATALOG
+    .map((s) => ({ ...s, dist_m: haversineM(lat, lon, s.lat, s.lon) }))
+    .filter((s) => s.dist_m <= ow.currentStationMaxKm * 1000)
+    .sort((a, b) => a.dist_m - b.dist_m)
+    .slice(0, ow.currentStationsMax * 3); // spare candidates for failures
+  const beginMs = startTMs - 2 * 3600e3;
+  const d = new Date(beginMs);
+  const pad = (x) => String(x).padStart(2, "0");
+  const begin = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  const range = Math.ceil(hoursNeeded + 8);
+  const out = [];
+  for (const c of cands) {
+    if (out.length >= ow.currentStationsMax) break;
+    try {
+      const j = await getJson(COOPS_DATA_URL, {
+        params: {
+          station: c.id, product: "currents_predictions",
+          begin_date: begin, range: String(range),
+          time_zone: "gmt", interval: "6", units: "metric", format: "json",
+        },
+        tries: 1, timeoutMs: 30000,
+      });
+      const cp = j.current_predictions && j.current_predictions.cp;
+      if (!Array.isArray(cp) || cp.length < 10) throw new Error("empty");
+      const series = cp.map((r) => {
+        const spd = Number(r.Velocity_Major) / 100; // cm/s (metric) → m/s, signed +flood/−ebb
+        const dir = ((spd >= 0 ? Number(r.meanFloodDir) : Number(r.meanEbbDir)) * Math.PI) / 180;
+        const mag = Math.abs(spd);
+        return { t: Date.parse(r.Time.replace(" ", "T") + "Z"), u: mag * Math.sin(dir), v: mag * Math.cos(dir) };
+      }).filter((x) => Number.isFinite(x.t) && Number.isFinite(x.u));
+      if (series.length < 10) throw new Error("unparseable");
+      out.push({ id: c.id, name: c.name, lat: c.lat, lon: c.lon, dist_km: Math.round(c.dist_m / 100) / 10, series });
+      if (log) log(`  current station ${c.id} ${c.name} @ ${(c.dist_m / 1000).toFixed(1)} km — ${series.length} pts`);
+    } catch (e) {
+      if (log) log(`  current station ${c.id} skipped: ${String(e).slice(0, 60)}`);
+    }
+  }
+  return out;
 }
 
 /** Hourly forecast wind at a point as [{t: ms, u, v}] (10 m, m/s). */
@@ -1784,8 +2036,10 @@ export function estimateShorelineBoom(lengthM, opts = {}) {
   return { boom_ft: boomFt, anchors: Math.max(2, Math.ceil(boomFt / anchorSpacingFt) + 1), protective: true };
 }
 
-/** One particle set. Pure + deterministic (seeded). Internal. */
-function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed }) {
+/** One particle set. Pure + deterministic (seeded). Internal.
+ *  currentAt(x, y, tMs) → [u, v] m/s (optional — coastal tidal blend);
+ *  currents advect at 100% (GNOME), windage rides on top. */
+function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, currentAt = null }) {
   const rng = owMakeRng(seed);
   const dt = ow.timestepS;
   const nSteps = Math.round((ow.durationHr * 3600) / dt);
@@ -1815,6 +2069,7 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed }) 
       beachTMs: null, beachSeg: null,
       windage: drawWindage(), windageAgeS: 0,
       pertF: 1, pertA: 0, pertAgeS: 0,
+      curF: 1, curA: 0,
     };
     if (uncertainty) drawPerturb(P[i]);
   }
@@ -1822,6 +2077,10 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed }) 
     p.pertF = Math.exp(rng.gaussian() * 0.3); // lognormal speed factor, median 1
     p.pertA = Math.max(-angCap, Math.min(angCap, (rng.gaussian() * 20 * Math.PI) / 180));
     p.pertAgeS = 0;
+    // current perturbation (GNOME §15 spirit): ±20% scale + small rotation,
+    // held for the run (currents re-randomize on the 48 h scale, > our runs)
+    p.curF = Math.exp(rng.gaussian() * 0.2);
+    p.curA = Math.max(-0.52, Math.min(0.52, (rng.gaussian() * 10 * Math.PI) / 180));
   }
 
   const hourly = [];
@@ -1857,8 +2116,18 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed }) 
         wu = p.pertF * (wu0 * c - wv0 * s);
         wv = p.pertF * (wu0 * s + wv0 * c);
       }
-      const nx = p.x + p.windage * wu * dt + rng.uniform(-1, 1) * diffStep;
-      const ny = p.y + p.windage * wv * dt + rng.uniform(-1, 1) * diffStep;
+      let cu = 0, cv = 0;
+      if (currentAt) {
+        [cu, cv] = currentAt(p.x, p.y, tMs);
+        if (uncertainty) {
+          const cc = Math.cos(p.curA), cs = Math.sin(p.curA);
+          const ru = p.curF * (cu * cc - cv * cs);
+          cv = p.curF * (cu * cs + cv * cc);
+          cu = ru;
+        }
+      }
+      const nx = p.x + (cu + p.windage * wu) * dt + rng.uniform(-1, 1) * diffStep;
+      const ny = p.y + (cv + p.windage * wv) * dt + rng.uniform(-1, 1) * diffStep;
       if (index) {
         const hit = owFirstCrossing(index, p.x, p.y, nx, ny);
         if (hit) {
@@ -1890,21 +2159,31 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
   const wb = waterbody || (await queryWaterbody(lat, lon, config));
   if (!wb) throw new Error("point is not inside an NHD waterbody");
-  const wind = await fetchWindSeries(lat, lon, startOffsetHr + ow.durationHr);
+  const startTMs = Date.now() + startOffsetHr * 3600000;
+  const coastal = isCoastalBody(wb);
+  const log = cfg.verbose ? (...a) => console.log(...a) : null;
+  const windP = fetchWindSeries(lat, lon, startOffsetHr + ow.durationHr);
+  // coastal: blended tidal-current field from the nearest prediction stations
+  let stationsP = Promise.resolve([]);
+  if (coastal && ow.coastalCurrents) {
+    stationsP = fetchCurrentStations(lat, lon, ow, ow.durationHr, startTMs, log)
+      .catch((e) => { if (log) log(`  current stations FAILED: ${e}`); return []; });
+  }
   const fetchSets = async (providers) => Promise.all(
     (providers || []).map(async (p) => ({
       name: p.name, buffer_m: p.buffer_m ?? 400, feats: await p.fetch(),
     })),
   );
-  const [siteSets, receptorSets] = await Promise.all(
-    [fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
+  const [wind, currentStations, siteSets, receptorSets] = await Promise.all(
+    [windP, stationsP, fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
   );
   return {
-    lat, lon, waterbody: wb,
+    lat, lon, waterbody: wb, coastal,
     windSeries: wind.series, windSource: wind.source,
+    currentStations,
     siteSets, receptorSets,
     startOffsetHr,
-    startTMs: Date.now() + startOffsetHr * 3600000,
+    startTMs,
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -1922,14 +2201,39 @@ const compass = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 22.5) 
 /** computeOpenWater — pure given data + config (seeded RNG in runRecord). */
 export function computeOpenWater(data, config = {}) {
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  // coastal water is more energetic — bump the diffusion default unless the
+  // config explicitly set one
+  if (data.coastal && (config.openWater?.diffusionM2s === undefined)) {
+    ow.diffusionM2s = ow.coastalDiffusionM2s;
+  }
   const log = (m) => ({ ...DEFAULT_CONFIG, ...config }).verbose && console.log(m);
   const t0 = Date.now();
   const proj = owProjection(data.lat, data.lon);
   const ringsXY = data.waterbody.rings.map((r) => r.map(([lo, la]) => proj.toXY(la, lo)));
   const index = owShorelineIndex(ringsXY);
 
+  // coastal tidal-current field: inverse-distance-squared blend of the
+  // station vectors (100 m floor keeps a click on top of a station finite)
+  let currentAt = null;
+  if (data.currentStations && data.currentStations.length) {
+    const sts = data.currentStations.map((s) => {
+      const [sx, sy] = proj.toXY(s.lat, s.lon);
+      return { sx, sy, series: s.series };
+    });
+    currentAt = (x, y, tMs) => {
+      let wu = 0, wv = 0, wsum = 0;
+      for (const s of sts) {
+        const dx = x - s.sx, dy = y - s.sy;
+        const w = 1 / Math.max(dx * dx + dy * dy, 1e4);
+        const [u, v] = owWindAt(s.series, tMs);
+        wu += w * u; wv += w * v; wsum += w;
+      }
+      return [wu / wsum, wv / wsum];
+    };
+  }
+
   const simArgs = {
-    x0: 0, y0: 0, tMs0: data.startTMs, windSeries: data.windSeries, index, ow,
+    x0: 0, y0: 0, tMs0: data.startTMs, windSeries: data.windSeries, index, ow, currentAt,
   };
   const best = owSimulate({ ...simArgs, uncertainty: false, seed: ow.seed });
   const regret = owSimulate({ ...simArgs, uncertainty: true, seed: ow.seed + 1 });
@@ -2053,19 +2357,35 @@ export function computeOpenWater(data, config = {}) {
     const regretTimes = regret.particles.filter((p) => p.beachTMs !== null)
       .map((p) => (p.beachTMs - data.startTMs) / 3600000).sort((a, b) => a - b);
     const early = regretTimes.length ? Math.round(regretTimes[0] * 10) / 10 : null;
+    const curNote = currentAt
+      ? ` + tidal currents (${data.currentStations.length} station${data.currentStations.length > 1 ? "s" : ""})`
+      : "";
     headline =
-      `Wind ${spd.toFixed(1)} m/s → drifting ${compass(towardDeg)}` +
+      `Wind ${spd.toFixed(1)} m/s → drifting ${compass(towardDeg)}${curNote}` +
       (bestFirst
         ? `; first shoreline arrival ~${early !== null && early < bestFirst.first_hr ? early + "–" : ""}${bestFirst.first_hr} h`
         : `; no shoreline arrival within ${ow.durationHr} h (best guess)`);
-    if (spd < 1.5) warnings.push(
+    if (spd < 1.5 && !currentAt) warnings.push(
       "Light/variable wind — drift direction is LOW CONFIDENCE; treat the uncertainty envelope as the planning footprint.");
   }
+  if (data.coastal && !currentAt) {
+    warnings.unshift(
+      `No CO-OPS current-prediction station within range — COASTAL drift is wind-only here; ` +
+      `tidal transport is NOT modeled and can dominate. Treat with caution.`);
+  }
+  if (currentAt) {
+    warnings.push(
+      `Tidal currents blended from ${data.currentStations.map((s) => s.id).join(", ")} ` +
+      `(nearest ${data.currentStations[0].dist_km} km) — station-axis predictions, not a circulation model; ` +
+      `accuracy degrades away from the stations.`);
+  }
   warnings.push(
-    "Open-water model: wind-drift surface transport only (GNOME-class physics) — no weathering, no lake-circulation currents; ETAs are forecast-wind dependent.");
+    "Open-water model: surface transport only (GNOME-class physics) — no weathering; ETAs depend on the wind forecast" +
+    (currentAt ? " and predicted tidal currents." : "; lake-circulation currents are not modeled."));
 
   const result = {
     mode: "open-water",
+    coastal: !!data.coastal,
     waterbody: { name: data.waterbody.name, area_sqkm: data.waterbody.area_sqkm, ftype: data.waterbody.ftype },
     spill_point: { lat: data.lat, lon: data.lon },
     start_offset_hr: data.startOffsetHr,
@@ -2091,6 +2411,8 @@ export function computeOpenWater(data, config = {}) {
       waterbody: { name: data.waterbody.name, area_sqkm: data.waterbody.area_sqkm, ftype: data.waterbody.ftype, rings: data.waterbody.rings.length },
       wind_source: data.windSource,
       wind_points: data.windSeries.length,
+      coastal: !!data.coastal,
+      current_stations: (data.currentStations || []).map((s) => ({ id: s.id, name: s.name, dist_km: s.dist_km })),
       start_offset_hr: data.startOffsetHr,
       seed: ow.seed,
       params: {
