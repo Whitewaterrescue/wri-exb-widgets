@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.9.1";
+export const ENGINE_VERSION = "1.9.2";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -1852,21 +1852,29 @@ async function nearRiverReach(lat, lon, minOrder, radiusM) {
   return { dist_m: bestD, wbareatype: best.wbareatype ?? null, comid: Number(best.comid) };
 }
 
-/** Containing NHD waterbody at a point, or null. Geometry simplified to ~30 m. */
+/** Containing NHD waterbody at a point, or null. Geometry simplified to ~30 m.
+ *  Falls back to the NHD *Area* layer for MARINE water only (FTYPE 445/493) —
+ *  large marine bodies (Bellingham Bay, Admiralty Inlet) are often absent from
+ *  the Waterbody layer, so open-water clicks there routed to the river path. */
 export async function queryWaterbody(lat, lon, config = {}) {
-  const j = await getJson(NHD_WATERBODY_URL, {
-    params: {
-      geometry: `${lon},${lat}`,
-      geometryType: "esriGeometryPoint",
-      inSR: "4326",
-      spatialRel: "esriSpatialRelIntersects",
-      outFields: "GNIS_NAME,AREASQKM,FTYPE", // UPPERCASE on this layer
-      returnGeometry: "true",
-      maxAllowableOffset: "0.0003",
-      f: "geojson",
-    },
-  });
-  const f = j.features && j.features[0];
+  const pipParams = {
+    geometry: `${lon},${lat}`,
+    geometryType: "esriGeometryPoint",
+    inSR: "4326",
+    spatialRel: "esriSpatialRelIntersects",
+    outFields: "GNIS_NAME,AREASQKM,FTYPE", // UPPERCASE on this layer
+    returnGeometry: "true",
+    maxAllowableOffset: "0.0003",
+    f: "geojson",
+  };
+  const j = await getJson(NHD_WATERBODY_URL, { params: pipParams });
+  let f = j.features && j.features[0];
+  if (!f) {
+    const ja = await getJson(NHD_AREA_URL, {
+      params: { ...pipParams, where: "FTYPE IN (445, 493)" },
+    }).catch(() => null);
+    f = ja && ja.features && ja.features[0];
+  }
   if (!f) return null;
   const rings = f.geometry.type === "Polygon"
     ? f.geometry.coordinates
