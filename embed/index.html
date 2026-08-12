@@ -139,7 +139,8 @@
           const fl = new FeatureLayer({ url: lc.url });
           const q = fl.createQuery();
           q.where = lc.where || "1=1";
-          q.outFields = [lc.nameField, ...(lc.extraFields || [])];
+          const ne = lc.noEquipment;
+          q.outFields = Array.from(new Set([lc.nameField, ...(lc.extraFields || []), ...(ne && ne.field ? [ne.field] : [])]));
           q.returnGeometry = true;
           q.outSpatialReference = { wkid: 4326 };
           const feats = await queryAllFeatures(fl, q);
@@ -148,6 +149,10 @@
             .map((f) => {
               const row = { name: f.attributes[lc.nameField], lat: f.geometry.y, lon: f.geometry.x };
               for (const ef of lc.extraFields || []) row[ef] = f.attributes[ef];
+              if (ne && ne.field && ne.values && ne.values.length) {
+                const v = String(f.attributes[ne.field] ?? "").trim().toUpperCase();
+                if (ne.values.some((x) => String(x).trim().toUpperCase() === v)) row.__noBoom = true;
+              }
               return row;
             });
           notes.push(`${label}: ${rows.length} point features loaded (buffer ${lc.bufferM ?? defBuf} m)`);
@@ -212,6 +217,7 @@
         reservePct: (eq && eq.reservePct) ?? 20,
       };
       for (const s of res.sites) {
+        if (s.__noBoom) continue; // notification-only point — list it, no boom
         const key = normGuid(s.GlobalID ?? s.globalid ?? s.GLOBALID);
         const drawnFt = key ? drawn.get(key) : undefined;
         if (drawnFt) {

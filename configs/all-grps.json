@@ -32,7 +32,14 @@
       "extraFields": [
         "Site_Type",
         "Site_Rank"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Missouri_River_GRP_Points_2025/FeatureServer/0",
@@ -41,7 +48,14 @@
       "extraFields": [
         "Site_Type",
         "Site_Rank"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Colorado_GRP_Points_2025/FeatureServer/0",
@@ -49,7 +63,14 @@
       "bufferM": 500,
       "extraFields": [
         "Site_Type"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Yellowstone_River_GRP_Points_2025_5/FeatureServer/0",
@@ -58,7 +79,14 @@
       "extraFields": [
         "Site_Type",
         "Site_Rank"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Lochsa_River_GRP_Points_2025/FeatureServer/0",
@@ -66,7 +94,14 @@
       "bufferM": 500,
       "extraFields": [
         "Site_Type"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Kootenai_River_GRP_Points_2025/FeatureServer/0",
@@ -74,7 +109,14 @@
       "bufferM": 500,
       "extraFields": [
         "Site_Type"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Upper_Kootenai_River_GRP_Points_2025/FeatureServer/0",
@@ -82,7 +124,14 @@
       "bufferM": 500,
       "extraFields": [
         "Site_Type"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/MF_Flathead_GRP_Points_2025_WFL1/FeatureServer/0",
@@ -90,7 +139,14 @@
       "bufferM": 500,
       "extraFields": [
         "Site_Type"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/Jocko_River_GRP_Points_2025/FeatureServer/0",
@@ -99,7 +155,14 @@
       "extraFields": [
         "Site_Type",
         "Site_Rank"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/BNSF_FRPs_2025/FeatureServer/1",
@@ -109,7 +172,14 @@
         "Site_Type",
         "Adjacent_Receiving_Waterbody",
         "Site_Contact"
-      ]
+      ],
+      "noEquipment": {
+        "field": "Site_Type",
+        "values": [
+          "Notification Only",
+          "Notification"
+        ]
+      }
     },
     {
       "url": "https://services2.arcgis.com/pOZUlCpCrXOga4Vx/arcgis/rest/services/WDOE_GRPs_Public_Release/FeatureServer/0",
@@ -117,7 +187,13 @@
       "bufferM": 500,
       "extraFields": [
         "SOURCE_TYPE"
-      ]
+      ],
+      "noEquipment": {
+        "field": "SOURCE_TYPE",
+        "values": [
+          "NOTIFICATION STRATEGY"
+        ]
+      }
     }
   ],
   "receptorLayers": [],
