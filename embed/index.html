@@ -401,7 +401,7 @@
     const owConfig = () => Object.assign({ verbose: false },
       { openWater: CFG.openWater || {} });
     async function continuationFor(res) {
-      const sp = res.impound_stop_point;
+      const sp = res.impound_stop_point || res.coastal_stop_point;
       const key = `${sp.lat.toFixed(4)},${sp.lon.toFixed(4)}`;
       if (!owContCache || owContCache.key !== key) {
         // reuse the river run's already-fetched site features (no second layer query)
@@ -514,8 +514,8 @@
         `${res.river_name || "Trace"} — ${res.distance_km_24h.toFixed(1)} km in ≤ ${CFG.maxHours ?? 24} h` +
         (fromCache ? " · recomputed instantly from cached hydrology" : "");
       // reservoir continuation (async — river result is already on screen)
-      if (res.impound_stop_point && (CFG.openWater?.continueAtImpoundment ?? true)) {
-        $("status").textContent += ` · modeling ${res.impound_stop_point.name}…`;
+      if ((res.impound_stop_point || res.coastal_stop_point) && (CFG.openWater?.continueAtImpoundment ?? true)) {
+        $("status").textContent += ` · modeling ${(res.impound_stop_point || res.coastal_stop_point).name}…`;
         continuationFor(res).then((ow) => {
           if (lastResult !== res) return; // superseded by a newer run
           res.open_water = ow;

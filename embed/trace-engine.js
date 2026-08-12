@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.8.0";
+export const ENGINE_VERSION = "1.9.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -1189,9 +1189,34 @@ export async function fetchTraceData(lat, lon, config = {}) {
     [fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
   );
 
+  // v1.9 coastal handoff: when the flowline network ends short of the
+  // requested distance (a river reaching tidewater), probe the terminal point
+  // against the NHD waterbody service so computeTrace can seed a coastal
+  // open-water continuation (mirrors the reservoir impoundment stop).
+  let terminalWater = null;
+  try {
+    const last = rows[rows.length - 1];
+    const totalKm = last ? last.cum_dist / 1000 : 0;
+    if (last && totalKm < cfg.maxDistanceKm * 0.95) {
+      let wb = await queryWaterbody(last.lat, last.lon, config);
+      if (!wb || !isCoastalBody(wb)) {
+        // river mouths often stop a hair short of the estuary polygon - probe
+        // ~400 m further along the final segment bearing
+        const prev = rows[Math.max(0, rows.length - 2)];
+        const dLat = last.lat - prev.lat, dLon = last.lon - prev.lon;
+        const norm = Math.hypot(dLat, dLon) || 1;
+        wb = await queryWaterbody(last.lat + (dLat / norm) * 0.004, last.lon + (dLon / norm) * 0.004, config);
+      }
+      if (wb && isCoastalBody(wb)) {
+        terminalWater = wb;
+        log(`  terminal tidewater: ${wb.name || "estuary/sea"} at ${totalKm.toFixed(1)} km (coastal continuation armed)`);
+      }
+    }
+  } catch (e) { log(`  terminal tidewater probe failed (${String(e).slice(0, 60)}) - trace unaffected`); }
+
   return {
     lat, lon, comid, snapName, snapDistM: snapD, riverName,
-    rows, gd, siteSets, receptorSets,
+    rows, gd, siteSets, receptorSets, terminalWater,
     asOf: cfg.asOf || "live",
     fetchedAt: new Date().toISOString(),
   };
@@ -1436,6 +1461,29 @@ export function computeTrace(data, config = {}) {
       };
     }
   }
+  // v1.9: river ends at tidewater (terminal estuary/sea polygon) and the
+  // plume gets there inside the window -> seed the open-water continuation
+  // exactly like a reservoir stop. Impoundment stop wins if both apply.
+  let coastalStopPoint = null;
+  let coastalNote = null;
+  if (!impoundStopPoint && data.terminalWater && df.length) {
+    const tr = df[df.length - 1];
+    const etaEnd = timeOf(tr);
+    if (etaEnd !== undefined && etaEnd < cfg.maxHours) {
+      const wbName = data.terminalWater.name || "tidewater";
+      coastalStopPoint = {
+        lat: tr.lat, lon: tr.lon,
+        eta_hr: Math.round(etaEnd * 100) / 100,
+        name: wbName,
+        coastal: true,
+      };
+      coastalNote =
+        `Trace reaches tidewater${wbName !== "tidewater" ? ` (${wbName})` : ""} at ` +
+        `${(tr.cum_dist / 1000).toFixed(1)} km — continuing as coastal ` +
+        `open-water drift (wind + tidal currents where available).`;
+      log(`  COASTAL STOP: ${coastalNote}`);
+    }
+  }
   df = df.filter((r) => timeOf(r) < cfg.maxHours);
   const maxCumTime = df.length ? timeOf(df[df.length - 1]) : 0;
   const nearestRow = (field, target) => {
@@ -1508,7 +1556,7 @@ export function computeTrace(data, config = {}) {
   const sites = [];
   for (const s of siteSets || []) sites.push(...proximity(s));
   sites.sort((a, b) => a.eta_hr - b.eta_hr);
-  const warnings = impoundNote ? [impoundNote] : [];
+  const warnings = [impoundNote, coastalNote].filter(Boolean);
   if (tidalApplied) {
     warnings.unshift(
       `Tidal reach MODELED with predicted tide at ${tidalApplied.station_name} ` +
@@ -1573,6 +1621,7 @@ export function computeTrace(data, config = {}) {
     jobson_degraded_points: jobson ? jobsonDegraded : null,
     impound_exclusions_applied: [...excluded].filter((c) => rows.some((r) => r.comid === c)),
     impound_stop_km: stopIdx !== null ? Math.round(rows[stopIdx].cum_dist / 100) / 10 : null,
+    coastal_stop: coastalStopPoint ? { ...coastalStopPoint } : null,
     corridor: data.corridorMeta || null,
     tidal: tidalApplied,
   };
@@ -1594,6 +1643,7 @@ export function computeTrace(data, config = {}) {
     avg_velocity_mph: avgVel * 2.23694,
     impound_stop: impoundNote,
     impound_stop_point: impoundStopPoint,
+    coastal_stop_point: coastalStopPoint,
     hourly,
     sites,
     warnings,
@@ -1634,7 +1684,7 @@ export async function runTrace(lat, lon, config = {}) {
   if (disp.mode === "open-water") return runOpenWater(lat, lon, config, disp.waterbody);
   const data = await fetchTraceData(lat, lon, config);
   const result = computeTrace(data, config);
-  if (ow.enabled && ow.continueAtImpoundment && result.impound_stop_point) {
+  if (ow.enabled && ow.continueAtImpoundment && (result.impound_stop_point || result.coastal_stop_point)) {
     try {
       result.open_water = await runOpenWaterContinuation(result, config);
     } catch (e) {
@@ -1805,10 +1855,14 @@ export async function queryWaterbody(lat, lon, config = {}) {
   const rings = f.geometry.type === "Polygon"
     ? f.geometry.coordinates
     : f.geometry.coordinates.flat(1); // MultiPolygon → all rings incl. islands
+  // marine slivers at river mouths are commonly unnamed in NHD — a coastal
+  // ftype without a GNIS name reads better as "tidewater" than "unnamed"
+  const ft = f.properties.FTYPE;
+  const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean";
   return {
-    name: f.properties.GNIS_NAME || "unnamed waterbody",
+    name: f.properties.GNIS_NAME || (coastalFt ? "tidewater" : "unnamed waterbody"),
     area_sqkm: f.properties.AREASQKM ?? null,
-    ftype: f.properties.FTYPE,
+    ftype: ft,
     rings,
   };
 }
@@ -2436,7 +2490,7 @@ export async function runOpenWater(lat, lon, config = {}, waterbody = null) {
 /** River trace ended at an impoundment → continue as open water from the
  *  entry point, clock offset by the river ETA. */
 export async function runOpenWaterContinuation(riverResult, config = {}) {
-  const sp = riverResult.impound_stop_point;
+  const sp = riverResult.impound_stop_point || riverResult.coastal_stop_point;
   if (!sp) return null;
   const data = await fetchOpenWaterData(sp.lat, sp.lon, config, null, sp.eta_hr);
   const owRes = computeOpenWater(data, config);
