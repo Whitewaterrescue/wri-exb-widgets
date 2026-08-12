@@ -117,6 +117,21 @@
     const bandColor = (hr) => (hr < 3 ? "#d7191c" : hr < 12 ? "#fdae61" : "#2c7bb6");
 
     // ---- providers (ports of the ExB widget's) ----
+    // queryFeatures with resultOffset pagination — a single query is capped at
+    // the layer's maxRecordCount (often 2000); large GRP sets (e.g. WDOE's
+    // 2,870 points) would silently truncate without this.
+    async function queryAllFeatures(fl, q) {
+      const out = [];
+      q.num = 2000;
+      for (;;) {
+        q.start = out.length;
+        const fs = await fl.queryFeatures(q);
+        out.push(...fs.features);
+        if (!fs.exceededTransferLimit || fs.features.length === 0 || out.length > 50000) break;
+      }
+      return out;
+    }
+
     const makeSiteProvider = (lc, defBuf, label, notes) => ({
       buffer_m: lc.bufferM ?? defBuf,
       fetch: async () => {
@@ -127,8 +142,8 @@
           q.outFields = [lc.nameField, ...(lc.extraFields || [])];
           q.returnGeometry = true;
           q.outSpatialReference = { wkid: 4326 };
-          const fs = await fl.queryFeatures(q);
-          const rows = fs.features
+          const feats = await queryAllFeatures(fl, q);
+          const rows = feats
             .filter((f) => f.geometry && f.geometry.type === "point")
             .map((f) => {
               const row = { name: f.attributes[lc.nameField], lat: f.geometry.y, lon: f.geometry.x };
@@ -177,9 +192,9 @@
       q.outFields = [bc.siteKeyField];
       q.returnGeometry = true;
       q.outSpatialReference = { wkid: 4326 };
-      const fs = await fl.queryFeatures(q);
+      const features = await queryAllFeatures(fl, q);
       const out = new Map();
-      for (const f of fs.features) {
+      for (const f of features) {
         const key = normGuid(f.attributes[bc.siteKeyField]);
         if (!key || !f.geometry) continue;
         const ft = geometryEngine.geodesicLength(f.geometry, "feet");
