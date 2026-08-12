@@ -411,7 +411,7 @@
         const data = await engine.fetchOpenWaterData(
           sp.lat, sp.lon,
           Object.assign(owConfig(), { siteProviders: cachedProviders }),
-          null, sp.eta_hr);
+          res.terminal_waterbody || null, sp.eta_hr);
         owContCache = { key, data };
       }
       const ow = engine.computeOpenWater(

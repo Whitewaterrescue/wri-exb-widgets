@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.9.0";
+export const ENGINE_VERSION = "1.9.1";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -1207,9 +1207,15 @@ export async function fetchTraceData(lat, lon, config = {}) {
         const norm = Math.hypot(dLat, dLon) || 1;
         wb = await queryWaterbody(last.lat + (dLat / norm) * 0.004, last.lon + (dLon / norm) * 0.004, config);
       }
+      if (!wb || !isCoastalBody(wb)) {
+        // delta/mudflat gap (e.g. Nooksack -> Bellingham Bay): the network can
+        // end a few km short of the marine polygon — search the area instead
+        wb = await queryCoastalWaterbodyNear(last.lat, last.lon, config);
+      }
       if (wb && isCoastalBody(wb)) {
         terminalWater = wb;
-        log(`  terminal tidewater: ${wb.name || "estuary/sea"} at ${totalKm.toFixed(1)} km (coastal continuation armed)`);
+        log(`  terminal tidewater: ${wb.name || "estuary/sea"} at ${totalKm.toFixed(1)} km` +
+          `${wb.gap_m ? ` (~${wb.gap_m} m across unnetworked flats)` : ""} (coastal continuation armed)`);
       }
     }
   } catch (e) { log(`  terminal tidewater probe failed (${String(e).slice(0, 60)}) - trace unaffected`); }
@@ -1480,7 +1486,10 @@ export function computeTrace(data, config = {}) {
       coastalNote =
         `Trace reaches tidewater${wbName !== "tidewater" ? ` (${wbName})` : ""} at ` +
         `${(tr.cum_dist / 1000).toFixed(1)} km — continuing as coastal ` +
-        `open-water drift (wind + tidal currents where available).`;
+        `open-water drift (wind + tidal currents where available).` +
+        (data.terminalWater.gap_m > 250
+          ? ` Entry crosses ~${(data.terminalWater.gap_m / 1000).toFixed(1)} km of unnetworked delta/flats (transit not modeled).`
+          : "");
       log(`  COASTAL STOP: ${coastalNote}`);
     }
   }
@@ -1644,6 +1653,9 @@ export function computeTrace(data, config = {}) {
     impound_stop: impoundNote,
     impound_stop_point: impoundStopPoint,
     coastal_stop_point: coastalStopPoint,
+    // polygon for the continuation (delta-gap terminals sit OUTSIDE it — the
+    // open-water fetch snaps the entry point in); not part of runRecord
+    terminal_waterbody: coastalStopPoint ? data.terminalWater : null,
     hourly,
     sites,
     warnings,
@@ -1780,6 +1792,10 @@ export function toGeoJson(result) {
 
 const NHD_WATERBODY_URL =
   "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12/query";
+// marine water (SeaOcean 445, some estuaries) lives in the NHD *Area* layer,
+// not Waterbody — e.g. Bellingham Bay is only in layer 9 ("Puget Sound")
+const NHD_AREA_URL =
+  "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/9/query";
 const OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast";
 const M_PER_DEG_LAT = 111120.00024; // GNOME Tech Doc §4
 
@@ -1865,6 +1881,90 @@ export async function queryWaterbody(lat, lon, config = {}) {
     ftype: ft,
     rings,
   };
+}
+
+/** Even-odd point-in-rings test (rings are [lon,lat] GeoJSON coordinates). */
+export function pointInRings(rings, lat, lon) {
+  let inside = false;
+  for (const ring of rings || []) {
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i], [xj, yj] = ring[j];
+      if ((yi > lat) !== (yj > lat) &&
+          lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Nearest point on any ring segment to (lat,lon) in a local-meters frame. */
+export function nearestOnRings(rings, lat, lon) {
+  const mLat = 111320, mLon = 111320 * Math.cos((lat * Math.PI) / 180);
+  let best = null, bestD = Infinity;
+  for (const ring of rings || []) {
+    for (let i = 0; i + 1 < ring.length; i++) {
+      const ax = (ring[i][0] - lon) * mLon, ay = (ring[i][1] - lat) * mLat;
+      const bx = (ring[i + 1][0] - lon) * mLon, by = (ring[i + 1][1] - lat) * mLat;
+      const dx = bx - ax, dy = by - ay;
+      const L2 = dx * dx + dy * dy;
+      const t = L2 > 0 ? Math.max(0, Math.min(1, (-ax * dx - ay * dy) / L2)) : 0;
+      const px = ax + t * dx, py = ay + t * dy;
+      const d = Math.hypot(px, py);
+      if (d < bestD) { bestD = d; best = { lat: lat + py / mLat, lon: lon + px / mLon }; }
+    }
+  }
+  return best ? { ...best, dist_m: bestD } : null;
+}
+
+/** Nearest coastal (Estuary/SeaOcean) waterbody within ~radiusDeg of a point —
+ *  river mouths often end a few km short of the marine polygon across
+ *  unnetworked delta/mudflats (e.g. the Nooksack at Bellingham Bay). */
+export async function queryCoastalWaterbodyNear(lat, lon, config = {}, radiusDeg = 0.05) {
+  let best = null;
+  for (const url of [NHD_WATERBODY_URL, NHD_AREA_URL]) {
+    const cand = await queryCoastalLayerNear(url, lat, lon, radiusDeg).catch(() => null);
+    if (cand && (!best || cand.gap_m < best.gap_m)) best = cand;
+    if (best && best.gap_m === 0) break;
+  }
+  return best;
+}
+
+async function queryCoastalLayerNear(url, lat, lon, radiusDeg) {
+  const j = await getJson(url, {
+    params: {
+      geometry: JSON.stringify({
+        xmin: lon - radiusDeg, ymin: lat - radiusDeg,
+        xmax: lon + radiusDeg, ymax: lat + radiusDeg,
+        spatialReference: { wkid: 4326 },
+      }),
+      geometryType: "esriGeometryEnvelope",
+      inSR: "4326",
+      spatialRel: "esriSpatialRelIntersects",
+      where: "FTYPE IN (445, 493)",
+      outFields: "GNIS_NAME,AREASQKM,FTYPE",
+      returnGeometry: "true",
+      maxAllowableOffset: "0.0003",
+      f: "geojson",
+    },
+  });
+  let best = null;
+  for (const f of j.features || []) {
+    const rings = f.geometry.type === "Polygon"
+      ? f.geometry.coordinates
+      : f.geometry.coordinates.flat(1);
+    const near = nearestOnRings(rings, lat, lon);
+    if (!near) continue;
+    const gap = pointInRings(rings, lat, lon) ? 0 : near.dist_m;
+    if (!best || gap < best.gap_m) {
+      best = {
+        name: f.properties.GNIS_NAME || "tidewater",
+        area_sqkm: f.properties.AREASQKM ?? null,
+        ftype: f.properties.FTYPE,
+        rings,
+        gap_m: Math.round(gap),
+      };
+    }
+  }
+  return best;
 }
 
 // ---- CO-OPS tidal-current predictions (Tier 3 coastal) ----------------------
@@ -2213,6 +2313,29 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
   const wb = waterbody || (await queryWaterbody(lat, lon, config));
   if (!wb) throw new Error("point is not inside an NHD waterbody");
+  // continuation entries can sit outside the polygon (river network ends on
+  // unnetworked delta/flats) — starting particles outside would beach them on
+  // the wrong side of the shoreline instantly, so snap just inside instead
+  let entrySnapM = 0;
+  if (!pointInRings(wb.rings, lat, lon)) {
+    const near = nearestOnRings(wb.rings, lat, lon);
+    if (!near) throw new Error("entry point outside waterbody and no shoreline found");
+    const stepM = 40;
+    const mLat = 111320, mLon = 111320 * Math.cos((near.lat * Math.PI) / 180);
+    // continue past the boundary along the approach bearing, then fall back
+    // to compass nudges; take the first candidate that lands in water
+    const bLat = near.lat - lat, bLon = near.lon - lon;
+    const bN = Math.hypot(bLat * mLat, bLon * mLon) || 1;
+    const cands = [
+      { lat: near.lat + (bLat * mLat / bN) * (stepM / mLat), lon: near.lon + (bLon * mLon / bN) * (stepM / mLon) },
+      { lat: near.lat + stepM / mLat, lon: near.lon }, { lat: near.lat - stepM / mLat, lon: near.lon },
+      { lat: near.lat, lon: near.lon + stepM / mLon }, { lat: near.lat, lon: near.lon - stepM / mLon },
+    ];
+    const inW = cands.find((c) => pointInRings(wb.rings, c.lat, c.lon));
+    if (!inW) throw new Error("could not find open water near the terminus");
+    entrySnapM = Math.round(near.dist_m + stepM);
+    lat = inW.lat; lon = inW.lon;
+  }
   const startTMs = Date.now() + startOffsetHr * 3600000;
   const coastal = isCoastalBody(wb);
   const log = cfg.verbose ? (...a) => console.log(...a) : null;
@@ -2232,7 +2355,7 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
     [windP, stationsP, fetchSets(cfg.siteProviders), fetchSets(cfg.receptorProviders)],
   );
   return {
-    lat, lon, waterbody: wb, coastal,
+    lat, lon, waterbody: wb, coastal, entrySnapM,
     windSeries: wind.series, windSource: wind.source,
     currentStations,
     siteSets, receptorSets,
@@ -2436,6 +2559,11 @@ export function computeOpenWater(data, config = {}) {
   warnings.push(
     "Open-water model: surface transport only (GNOME-class physics) — no weathering; ETAs depend on the wind forecast" +
     (currentAt ? " and predicted tidal currents." : "; lake-circulation currents are not modeled."));
+  if (data.entrySnapM > 250) {
+    warnings.push(
+      `Open-water entry snapped ~${(data.entrySnapM / 1000).toFixed(1)} km from the river terminus ` +
+      `across unnetworked delta/flats — nearshore arrival times are approximate.`);
+  }
 
   const result = {
     mode: "open-water",
@@ -2492,7 +2620,7 @@ export async function runOpenWater(lat, lon, config = {}, waterbody = null) {
 export async function runOpenWaterContinuation(riverResult, config = {}) {
   const sp = riverResult.impound_stop_point || riverResult.coastal_stop_point;
   if (!sp) return null;
-  const data = await fetchOpenWaterData(sp.lat, sp.lon, config, null, sp.eta_hr);
+  const data = await fetchOpenWaterData(sp.lat, sp.lon, config, riverResult.terminal_waterbody || null, sp.eta_hr);
   const owRes = computeOpenWater(data, config);
   owRes.continuation_of = {
     river: riverResult.river_name,
