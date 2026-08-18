@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.9.2";
+export const ENGINE_VERSION = "1.10.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -82,6 +82,10 @@ export const DEFAULT_OPENWATER = {
                               // (guards removed-dam relic polygons, farm ponds)
   riverOverrideM: 400,        // non-impounded reach this close → river mode wins
                               // (dam tailraces sit inside reservoir polygons)
+  riverAreaDispatchSqKm: 10,  // v1.10: FTYPE 460 river-Area polygons this big are
+                              // estuaries in practice (Duluth's St. Louis Bay is a
+                              // 30 km² unnamed 460 with no Waterbody polygon at
+                              // all) — dispatch/continue open water there; 0 = off
   nParticles: 1000,
   durationHr: 24,             // sim length from water entry (continuations too)
   timestepS: 900,
@@ -1193,13 +1197,19 @@ export async function fetchTraceData(lat, lon, config = {}) {
   // requested distance (a river reaching tidewater), probe the terminal point
   // against the NHD waterbody service so computeTrace can seed a coastal
   // open-water continuation (mirrors the reservoir impoundment stop).
+  // v1.10: also arms for terminal LAKES (Great Lakes are LakePond 390, Great
+  // Salt Lake class too) and large river-Area estuaries (St. Louis Bay 460).
   let terminalWater = null;
   try {
     const last = rows[rows.length - 1];
     const totalKm = last ? last.cum_dist / 1000 : 0;
     if (last && totalKm < cfg.maxDistanceKm * 0.95) {
+      const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+      const accepts = (wb) => !!wb && (isCoastalBody(wb) ||
+        (isOpenWaterBody(wb) && wb.area_sqkm >= ow.minLakeSqKm) ||
+        isRiverAreaEstuary(wb, ow));
       let wb = await queryWaterbody(last.lat, last.lon, config);
-      if (!wb || !isCoastalBody(wb)) {
+      if (!accepts(wb)) {
         // river mouths often stop a hair short of the estuary polygon - probe
         // ~400 m further along the final segment bearing
         const prev = rows[Math.max(0, rows.length - 2)];
@@ -1207,18 +1217,21 @@ export async function fetchTraceData(lat, lon, config = {}) {
         const norm = Math.hypot(dLat, dLon) || 1;
         wb = await queryWaterbody(last.lat + (dLat / norm) * 0.004, last.lon + (dLon / norm) * 0.004, config);
       }
-      if (!wb || !isCoastalBody(wb)) {
+      if (!accepts(wb)) {
         // delta/mudflat gap (e.g. Nooksack -> Bellingham Bay): the network can
-        // end a few km short of the marine polygon — search the area instead
-        wb = await queryCoastalWaterbodyNear(last.lat, last.lon, config);
+        // end a few km short of the marine polygon — search the area instead.
+        // Marine gaps span km of flats; a NON-marine hit this far from a true
+        // dead-end is more likely a data gap than a mouth, so cap it at 1 km.
+        wb = await queryOpenWaterNear(last.lat, last.lon, config);
+        if (wb && !isCoastalBody(wb) && (wb.gap_m || 0) > 1000) wb = null;
       }
-      if (wb && isCoastalBody(wb)) {
+      if (accepts(wb)) {
         terminalWater = wb;
-        log(`  terminal tidewater: ${wb.name || "estuary/sea"} at ${totalKm.toFixed(1)} km` +
-          `${wb.gap_m ? ` (~${wb.gap_m} m across unnetworked flats)` : ""} (coastal continuation armed)`);
+        log(`  terminal open water: ${wb.name || "estuary/sea"} at ${totalKm.toFixed(1)} km` +
+          `${wb.gap_m ? ` (~${wb.gap_m} m across unnetworked flats)` : ""} (open-water continuation armed)`);
       }
     }
-  } catch (e) { log(`  terminal tidewater probe failed (${String(e).slice(0, 60)}) - trace unaffected`); }
+  } catch (e) { log(`  terminal open-water probe failed (${String(e).slice(0, 60)}) - trace unaffected`); }
 
   return {
     lat, lon, comid, snapName, snapDistM: snapD, riverName,
@@ -1476,17 +1489,21 @@ export function computeTrace(data, config = {}) {
     const tr = df[df.length - 1];
     const etaEnd = timeOf(tr);
     if (etaEnd !== undefined && etaEnd < cfg.maxHours) {
-      const wbName = data.terminalWater.name || "tidewater";
+      const marine = isCoastalBody(data.terminalWater);
+      const wbName = data.terminalWater.name || (marine ? "tidewater" : "open water");
       coastalStopPoint = {
         lat: tr.lat, lon: tr.lon,
         eta_hr: Math.round(etaEnd * 100) / 100,
         name: wbName,
-        coastal: true,
+        coastal: marine,
       };
+      const kind = marine ? "tidewater" : "open water";
       coastalNote =
-        `Trace reaches tidewater${wbName !== "tidewater" ? ` (${wbName})` : ""} at ` +
-        `${(tr.cum_dist / 1000).toFixed(1)} km — continuing as coastal ` +
-        `open-water drift (wind + tidal currents where available).` +
+        `Trace reaches ${kind}${wbName !== kind ? ` (${wbName})` : ""} at ` +
+        `${(tr.cum_dist / 1000).toFixed(1)} km — continuing as ` +
+        (marine
+          ? `coastal open-water drift (wind + tidal currents where available).`
+          : `open-water wind drift.`) +
         (data.terminalWater.gap_m > 250
           ? ` Entry crosses ~${(data.terminalWater.gap_m / 1000).toFixed(1)} km of unnetworked delta/flats (transit not modeled).`
           : "");
@@ -1680,7 +1697,12 @@ export async function resolveTraceMode(lat, lon, config = {}) {
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
   if (!ow.enabled) return { mode: "river" };
   const wb = await queryWaterbody(lat, lon, config);
-  if (!wb || !isOpenWaterBody(wb) || !(wb.area_sqkm >= ow.minLakeSqKm)) return { mode: "river" };
+  const lakeHit = wb && isOpenWaterBody(wb) && wb.area_sqkm >= ow.minLakeSqKm;
+  // v1.10: large FTYPE 460 river-Area polygons are estuaries in practice on
+  // the Great Lakes (St. Louis Bay, Duluth) — same tiebreak below guards
+  // ordinary big-river clicks (a live reach within riverOverrideM wins)
+  const estuaryHit = !lakeHit && wb && isRiverAreaEstuary(wb, ow);
+  if (!lakeHit && !estuaryHit) return { mode: "river" };
   const cfg = { ...DEFAULT_CONFIG, ...config };
   try {
     if (await nearRiverReach(lat, lon, cfg.minStreamOrder, ow.riverOverrideM)) {
@@ -1811,6 +1833,15 @@ export function isCoastalBody(wb) {
   const f = wb && wb.ftype;
   return f === 493 || f === 445 || f === "Estuary" || f === "SeaOcean";
 }
+/** v1.10: large FTYPE 460 "StreamRiver" Area polygons act as estuaries on the
+ *  Great Lakes — Duluth's St. Louis Bay estuary has NO Waterbody polygon, only
+ *  an unnamed 30 km² river-Area polygon. Eligible for open-water treatment
+ *  when bigger than ow.riverAreaDispatchSqKm (0 disables). */
+export function isRiverAreaEstuary(wb, ow) {
+  const f = wb && wb.ftype;
+  return (f === 460 || f === "StreamRiver") &&
+    ow.riverAreaDispatchSqKm > 0 && wb.area_sqkm >= ow.riverAreaDispatchSqKm;
+}
 
 /**
  * Nearest flowline reach within radiusM (wbareatype included) — dispatch
@@ -1853,9 +1884,12 @@ async function nearRiverReach(lat, lon, minOrder, radiusM) {
 }
 
 /** Containing NHD waterbody at a point, or null. Geometry simplified to ~30 m.
- *  Falls back to the NHD *Area* layer for MARINE water only (FTYPE 445/493) —
- *  large marine bodies (Bellingham Bay, Admiralty Inlet) are often absent from
- *  the Waterbody layer, so open-water clicks there routed to the river path. */
+ *  Falls back to the NHD *Area* layer for MARINE water (FTYPE 445/493) and
+ *  river-Area polygons (460) — large marine bodies (Bellingham Bay, Admiralty
+ *  Inlet) are often absent from the Waterbody layer, and Great Lakes estuaries
+ *  (St. Louis Bay, Duluth) exist ONLY as unnamed 460 Area polygons. Callers
+ *  gate on ftype/area (isOpenWaterBody / isRiverAreaEstuary), so returning a
+ *  460 here cannot flip ordinary river clicks to open water by itself. */
 export async function queryWaterbody(lat, lon, config = {}) {
   const pipParams = {
     geometry: `${lon},${lat}`,
@@ -1871,7 +1905,7 @@ export async function queryWaterbody(lat, lon, config = {}) {
   let f = j.features && j.features[0];
   if (!f) {
     const ja = await getJson(NHD_AREA_URL, {
-      params: { ...pipParams, where: "FTYPE IN (445, 493)" },
+      params: { ...pipParams, where: "FTYPE IN (445, 493, 460)" },
     }).catch(() => null);
     f = ja && ja.features && ja.features[0];
   }
@@ -1883,8 +1917,10 @@ export async function queryWaterbody(lat, lon, config = {}) {
   // ftype without a GNIS name reads better as "tidewater" than "unnamed"
   const ft = f.properties.FTYPE;
   const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean";
+  const riverAreaFt = ft === 460 || ft === "StreamRiver";
   return {
-    name: f.properties.GNIS_NAME || (coastalFt ? "tidewater" : "unnamed waterbody"),
+    name: f.properties.GNIS_NAME ||
+      (coastalFt ? "tidewater" : riverAreaFt ? "river estuary" : "unnamed waterbody"),
     area_sqkm: f.properties.AREASQKM ?? null,
     ftype: ft,
     rings,
@@ -1936,7 +1972,23 @@ export async function queryCoastalWaterbodyNear(lat, lon, config = {}, radiusDeg
   return best;
 }
 
-async function queryCoastalLayerNear(url, lat, lon, radiusDeg) {
+/** v1.10: generalized near-search for open-water continuations — accepts
+ *  lakes/reservoirs and large river-Area estuaries as well as marine water.
+ *  Great Lakes water is LakePond (390) and Great Lakes estuaries are 460,
+ *  both invisible to the marine-only search above; impoundment stop points
+ *  can also land in polygon gaps (the Admiralty Inlet class). */
+export async function queryOpenWaterNear(lat, lon, config = {}, radiusDeg = 0.05) {
+  let best = null;
+  for (const url of [NHD_WATERBODY_URL, NHD_AREA_URL]) {
+    const cand = await queryCoastalLayerNear(url, lat, lon, radiusDeg,
+      "FTYPE IN (390, 436, 445, 493, 460)").catch(() => null);
+    if (cand && (!best || cand.gap_m < best.gap_m)) best = cand;
+    if (best && best.gap_m === 0) break;
+  }
+  return best;
+}
+
+async function queryCoastalLayerNear(url, lat, lon, radiusDeg, where = "FTYPE IN (445, 493)") {
   const j = await getJson(url, {
     params: {
       geometry: JSON.stringify({
@@ -1947,7 +1999,7 @@ async function queryCoastalLayerNear(url, lat, lon, radiusDeg) {
       geometryType: "esriGeometryEnvelope",
       inSR: "4326",
       spatialRel: "esriSpatialRelIntersects",
-      where: "FTYPE IN (445, 493)",
+      where,
       outFields: "GNIS_NAME,AREASQKM,FTYPE",
       returnGeometry: "true",
       maxAllowableOffset: "0.0003",
@@ -1963,8 +2015,10 @@ async function queryCoastalLayerNear(url, lat, lon, radiusDeg) {
     if (!near) continue;
     const gap = pointInRings(rings, lat, lon) ? 0 : near.dist_m;
     if (!best || gap < best.gap_m) {
+      const nft = f.properties.FTYPE;
       best = {
-        name: f.properties.GNIS_NAME || "tidewater",
+        name: f.properties.GNIS_NAME ||
+          (nft === 493 || nft === 445 ? "tidewater" : nft === 460 ? "river estuary" : "unnamed waterbody"),
         area_sqkm: f.properties.AREASQKM ?? null,
         ftype: f.properties.FTYPE,
         rings,
@@ -2319,7 +2373,11 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
 export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null, startOffsetHr = 0) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
-  const wb = waterbody || (await queryWaterbody(lat, lon, config));
+  let wb = waterbody || (await queryWaterbody(lat, lon, config));
+  // v1.10 rescue: impoundment stop points can land in NHD polygon gaps, or in
+  // water that only exists as a lake/river-Area polygon nearby — search the
+  // area before giving up (the entry snap below handles landing outside it)
+  if (!wb) wb = await queryOpenWaterNear(lat, lon, config).catch(() => null);
   if (!wb) throw new Error("point is not inside an NHD waterbody");
   // continuation entries can sit outside the polygon (river network ends on
   // unnetworked delta/flats) — starting particles outside would beach them on
@@ -2567,6 +2625,12 @@ export function computeOpenWater(data, config = {}) {
   warnings.push(
     "Open-water model: surface transport only (GNOME-class physics) — no weathering; ETAs depend on the wind forecast" +
     (currentAt ? " and predicted tidal currents." : "; lake-circulation currents are not modeled."));
+  const wbFt = data.waterbody.ftype;
+  if (wbFt === 460 || wbFt === "StreamRiver") {
+    warnings.push(
+      "This harbor/estuary is mapped in NHD as a river-area polygon — wind drift is modeled " +
+      "within it; river through-flow and exchange with adjacent open water are not modeled.");
+  }
   if (data.entrySnapM > 250) {
     warnings.push(
       `Open-water entry snapped ~${(data.entrySnapM / 1000).toFixed(1)} km from the river terminus ` +
