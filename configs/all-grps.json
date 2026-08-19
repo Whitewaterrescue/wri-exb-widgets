@@ -182,17 +182,19 @@
       }
     },
     {
-      "url": "https://services2.arcgis.com/pOZUlCpCrXOga4Vx/arcgis/rest/services/WDOE_GRPs_Public_Release/FeatureServer/0",
-      "nameField": "ShortName",
+      "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/WA_ECY_GRP_Strategies/FeatureServer/0",
+      "nameField": "GeographicName",
       "bufferM": 500,
       "extraFields": [
-        "SOURCE_TYPE"
+        "ShortName",
+        "SubAreaName",
+        "WatercourseDescription",
+        "GlobalID"
       ],
-      "noEquipment": {
-        "field": "SOURCE_TYPE",
-        "values": [
-          "NOTIFICATION STRATEGY"
-        ]
+      "boomLayer": {
+        "url": "https://services6.arcgis.com/Ji79lWGR5B33LhY7/arcgis/rest/services/WA_ECY_GRP_Strategies/FeatureServer/4",
+        "siteKeyField": "site_globalid",
+        "where": "SubAreaCode = 'SPR'"
       }
     },
     {
