@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.10.0";
+export const ENGINE_VERSION = "1.11.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -47,7 +47,43 @@ const ECCC_API = "https://api.weather.gc.ca/collections";
 export const REMOVED_IMPOUNDMENT_COMIDS = new Set([
   // Milltown Dam, Clark Fork at Bonner MT — removed 2008-2010 (reported by Cody 2026-07-07)
   24293120, 24293122, 24293124,
+
+  // --- v1.11 sweep (2026-09-14). Every comid below was confirmed against a
+  // live wmadata:nhdflowline_network query as still carrying wbareatype
+  // 'LakePond'. Reaches were only added where the removal is documented AND
+  // the reach sits in the former pool: Bull Run (OR), Lake Walcott (ID) and
+  // Flathead (MT) came back in the same sweep and are REAL — left alone.
+  // Rogue (Savage Rapids/Gold Ray), Hood (Powerdale) and Penobscot
+  // (Veazie/Great Works) came back clean — NHD already updated, nothing to add.
+
+  // Elwha Dam, Elwha River WA — removed 2012 (former Lake Aldwell)
+  23997058, 23997060, 23997062,
+  // Glines Canyon Dam, Elwha River WA — removed 2014 (former Lake Mills)
+  23997112, 23997114, 23997116, 23997118, 23997120, 23997122, 23997158,
+
+  // Klamath River CA/OR — J.C. Boyle, Copco 1 & 2, Iron Gate, removed 2023-24.
+  // NOTE: the NHD *polygon* layer is stale here too (Iron Gate 3.8 km² and
+  // Copco Lake 4.0 km² still present), so these also need nearRiverReach to
+  // treat them as free-flowing or a pool click still dispatches open water.
+  359311, 359315, 359319, 359321, 359327, 359331, 359333,
+  362867, 362869, 362871, 362875, 362881, 362883, 362889, 362893, 362895,
+  362899, 362909, 362917, 362919, 362923, 362927,
+  // ...and the tributary arms that lay inside those pools
+  359309,                                  // unnamed, in John C Boyle Reservoir
+  362855, 362861, 362873,                  // unnamed + Scotch Creek, in Iron Gate Reservoir
+  362851, 364747, 362853,                  // Camp Creek + Scotch Creek arms, Iron Gate
+  // Jenny Creek 359325 is flagged LakePond with no pool polygon and no
+  // documented removal — deliberately NOT excluded (an isolated reach cannot
+  // reach impoundStopKm anyway, and a stale stop is the safe failure mode).
+
+  // Condit Dam, White Salmon River WA — removed 2011 (former Northwestern Lake)
+  24504802, 24504804, 24504806,
 ]);
+
+/** Removed-dam comids for this run: the built-in list plus per-run additions. */
+export function excludedImpoundments(cfg) {
+  return new Set([...REMOVED_IMPOUNDMENT_COMIDS, ...(cfg.impoundExcludeComids || [])]);
+}
 
 export const DEFAULT_CONFIG = {
   maxDistanceKm: 300,
@@ -104,6 +140,23 @@ export const DEFAULT_OPENWATER = {
   currentStationsMax: 3,
   currentStationMaxKm: 15,
   coastalDiffusionM2s: 10,    // GNOME coastal default (lakes stay at 1)
+  // v1.11 domain: NHD splits water into abutting polygons, and one polygon's
+  // edge is not a shoreline. The domain is every water polygon near the run;
+  // segments with domain water on the far side are seams, not land.
+  domainSearchKm: 40,         // envelope radius for neighbouring polygons
+  domainMaxPolys: 12,         // cap (biggest first; the click's own is kept)
+  domainMinSqKm: 1.0,         // ignore ponds this small unless they are marine
+  seamProbeM: 150,            // probe offset for the water-on-the-far-side test
+  seamCoincidenceM: 80,       // ...and the neighbour's edge must be this close
+                              // (or overlap), so a narrow spit is not jumped
+  // v1.11 open boundaries: edges where the DATA ends, not the water — the
+  // US/Canada line through the Strait of Juan de Fuca and the Great Lakes.
+  // Particles crossing one leave the modeled domain instead of beaching.
+  openBoundaries: [],         // authored polyline docs or URLs (see marine/)
+  openBoundaryTolM: 300,      // segment within this of an authored line = open
+  openBoundaryMinSegM: 2000,  // ...or longer than this. NHD coast at ~30 m
+                              // simplification never exceeds ~1.3 km/segment;
+                              // marine data edges run 3-29 km. 0 = off.
 };
 
 // ---------------------------------------------------------------- helpers
@@ -1205,9 +1258,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     const totalKm = last ? last.cum_dist / 1000 : 0;
     if (last && totalKm < cfg.maxDistanceKm * 0.95) {
       const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
-      const accepts = (wb) => !!wb && (isCoastalBody(wb) ||
-        (isOpenWaterBody(wb) && wb.area_sqkm >= ow.minLakeSqKm) ||
-        isRiverAreaEstuary(wb, ow));
+      const accepts = (wb) => acceptsOpenWater(wb, ow);
       let wb = await queryWaterbody(last.lat, last.lon, config);
       if (!accepts(wb)) {
         // river mouths often stop a hair short of the estuary polygon - probe
@@ -1357,7 +1408,7 @@ export function computeTrace(data, config = {}) {
 
   // 5. impoundment rule: flowline passes through a LakePond/Reservoir waterbody
   // (minus known REMOVED dams whose waterbody flags linger in NHDPlus)
-  const excluded = new Set([...REMOVED_IMPOUNDMENT_COMIDS, ...(cfg.impoundExcludeComids || [])]);
+  const excluded = excludedImpoundments(cfg);
   let stopIdx = null, runM = 0.0;
   for (let i = 0; i < rows.length; i++) {
     const imp = (rows[i].wbareatype === "LakePond" || rows[i].wbareatype === "Reservoir") &&
@@ -1705,7 +1756,8 @@ export async function resolveTraceMode(lat, lon, config = {}) {
   if (!lakeHit && !estuaryHit) return { mode: "river" };
   const cfg = { ...DEFAULT_CONFIG, ...config };
   try {
-    if (await nearRiverReach(lat, lon, cfg.minStreamOrder, ow.riverOverrideM)) {
+    if (await nearRiverReach(lat, lon, cfg.minStreamOrder, ow.riverOverrideM,
+                             excludedImpoundments(cfg))) {
       return { mode: "river", waterbody: wb };
     }
   } catch { /* tiebreak unavailable → open water (the PIP hit stands) */ }
@@ -1843,13 +1895,24 @@ export function isRiverAreaEstuary(wb, ow) {
     ow.riverAreaDispatchSqKm > 0 && wb.area_sqkm >= ow.riverAreaDispatchSqKm;
 }
 
+/** Is this waterbody big enough / marine enough to run the particle model in?
+ *  v1.11: shared by the terminal-water probe (fetchTraceData) and the
+ *  continuation rescue (fetchOpenWaterData), which previously accepted ANY
+ *  polygon — a phantom dam then produced a 1,000-particle plume inside a
+ *  0.14 km² river-Area sliver on the Elwha. A river channel is not open water. */
+export function acceptsOpenWater(wb, ow) {
+  return !!wb && (isCoastalBody(wb) ||
+    (isOpenWaterBody(wb) && (wb.area_sqkm || 0) >= ow.minLakeSqKm) ||
+    isRiverAreaEstuary(wb, ow));
+}
+
 /**
  * Nearest flowline reach within radiusM (wbareatype included) — dispatch
  * tiebreak: NHD reservoir polygons extend over dam tailraces, and a click
  * there means the RIVER below, not the pool (caught live at American Falls:
  * the reservoir polygon contains the tailrace at 42.7803,-112.8767).
  */
-async function nearRiverReach(lat, lon, minOrder, radiusM) {
+async function nearRiverReach(lat, lon, minOrder, radiusM, excluded = null) {
   const box = radiusM / 111000; // degrees, generous at these latitudes
   const j = await getJson(GEOSERVER, {
     data: {
@@ -1870,7 +1933,12 @@ async function nearRiverReach(lat, lon, minOrder, radiusM) {
   let best = null, bestD = Infinity;
   for (const f of j.features || []) {
     const wba = f.properties.wbareatype;
-    if (wba === "LakePond" || wba === "Reservoir") continue;
+    // v1.11: a reach flagged impounded by a REMOVED dam is free-flowing in
+    // reality, so it must count as river context here too — otherwise a click
+    // on a drained pool whose NHD polygon is still published (Klamath: Iron
+    // Gate, Copco) dispatches open water on a now free-flowing river.
+    const removed = excluded && excluded.has(Number(f.properties.comid));
+    if ((wba === "LakePond" || wba === "Reservoir") && !removed) continue;
     const g = f.geometry;
     const paths = g.type === "LineString" ? [g.coordinates] : g.coordinates;
     for (const path of paths)
@@ -1896,7 +1964,8 @@ export async function queryWaterbody(lat, lon, config = {}) {
     geometryType: "esriGeometryPoint",
     inSR: "4326",
     spatialRel: "esriSpatialRelIntersects",
-    outFields: "GNIS_NAME,AREASQKM,FTYPE", // UPPERCASE on this layer
+    // PERMANENT_IDENTIFIER (v1.11) identifies the polygon for domain de-duping
+    outFields: "GNIS_NAME,AREASQKM,FTYPE,PERMANENT_IDENTIFIER", // UPPERCASE on this layer
     returnGeometry: "true",
     maxAllowableOffset: "0.0003",
     f: "geojson",
@@ -1909,22 +1978,9 @@ export async function queryWaterbody(lat, lon, config = {}) {
     }).catch(() => null);
     f = ja && ja.features && ja.features[0];
   }
-  if (!f) return null;
-  const rings = f.geometry.type === "Polygon"
-    ? f.geometry.coordinates
-    : f.geometry.coordinates.flat(1); // MultiPolygon → all rings incl. islands
   // marine slivers at river mouths are commonly unnamed in NHD — a coastal
   // ftype without a GNIS name reads better as "tidewater" than "unnamed"
-  const ft = f.properties.FTYPE;
-  const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean";
-  const riverAreaFt = ft === 460 || ft === "StreamRiver";
-  return {
-    name: f.properties.GNIS_NAME ||
-      (coastalFt ? "tidewater" : riverAreaFt ? "river estuary" : "unnamed waterbody"),
-    area_sqkm: f.properties.AREASQKM ?? null,
-    ftype: ft,
-    rings,
-  };
+  return parseWaterFeature(f);
 }
 
 /** Even-odd point-in-rings test (rings are [lon,lat] GeoJSON coordinates). */
@@ -2027,6 +2083,291 @@ async function queryCoastalLayerNear(url, lat, lon, radiusDeg, where = "FTYPE IN
     }
   }
   return best;
+}
+
+// ---- v1.11: the open-water DOMAIN (many polygons, seams removed) ------------
+//
+// NHD publishes marine water as a set of abutting tiles, not one body. The
+// engine used to take features[0] and treat that single polygon's ring as the
+// whole world, so every tile boundary became "shoreline". Measured on the
+// Elwha: the seam between Puget Sound tile 166774908 and its western neighbour
+// 166774949 sits 410 m west of the river mouth, and a second seam 8.9 km north
+// — a plume entering at the mouth hit an invented wall almost immediately.
+//
+// The domain is every water polygon near the run. A ring segment with domain
+// water on its far side is an INTERNAL SEAM and is dropped from the land
+// index; everything else stays shoreline. Measured on the Elwha domain: 13
+// segments / 77.8 km classified seam, 492 segments / 208.1 km real shoreline.
+
+/** Parse one NHD polygon feature into the engine's waterbody shape. */
+function parseWaterFeature(f) {
+  if (!f || !f.geometry) return null;
+  const rings = f.geometry.type === "Polygon"
+    ? f.geometry.coordinates
+    : f.geometry.coordinates.flat(1);
+  if (!rings.length) return null;
+  const ft = f.properties.FTYPE;
+  const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean";
+  const riverAreaFt = ft === 460 || ft === "StreamRiver";
+  return {
+    name: f.properties.GNIS_NAME ||
+      (coastalFt ? "tidewater" : riverAreaFt ? "river estuary" : "unnamed waterbody"),
+    area_sqkm: f.properties.AREASQKM ?? null,
+    ftype: ft,
+    pid: f.properties.PERMANENT_IDENTIFIER ?? null,
+    rings,
+  };
+}
+
+export function ringsBbox(rings) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const r of rings || []) for (const c of r) {
+    if (c[0] < x0) x0 = c[0];
+    if (c[0] > x1) x1 = c[0];
+    if (c[1] < y0) y0 = c[1];
+    if (c[1] > y1) y1 = c[1];
+  }
+  return [x0, y0, x1, y1];
+}
+
+/** Every water polygon intersecting an envelope around the point. */
+async function queryWaterPolysIn(url, lat, lon, radiusDeg, where) {
+  const j = await getJson(url, {
+    params: {
+      geometry: JSON.stringify({
+        xmin: lon - radiusDeg, ymin: lat - radiusDeg,
+        xmax: lon + radiusDeg, ymax: lat + radiusDeg,
+        spatialReference: { wkid: 4326 },
+      }),
+      geometryType: "esriGeometryEnvelope",
+      inSR: "4326",
+      spatialRel: "esriSpatialRelIntersects",
+      where,
+      outFields: "GNIS_NAME,AREASQKM,FTYPE,PERMANENT_IDENTIFIER",
+      returnGeometry: "true",
+      maxAllowableOffset: "0.0003",
+      f: "geojson",
+    },
+  });
+  return (j.features || []).map(parseWaterFeature).filter(Boolean);
+}
+
+/** Build the open-water domain around a run: the polygon the plume starts in
+ *  plus every neighbouring water polygon big enough to matter. */
+export async function queryWaterDomain(lat, lon, config = {}, primary = null) {
+  const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  const radiusDeg = Math.max(0.05, ow.domainSearchKm / 111.0);
+  const seen = new Map();
+  const key = (p) => p.pid || `${p.name}|${p.ftype}|${p.area_sqkm}`;
+  const add = (p) => { if (p && !seen.has(key(p))) seen.set(key(p), p); };
+  add(primary);
+  const where = "FTYPE IN (390, 436, 445, 493, 460)";
+  // both layers in parallel — these are the two slowest calls in an open-water
+  // run (~5 s serial on a 40 km Puget Sound envelope), and they are independent
+  const batches = await Promise.all(
+    [NHD_WATERBODY_URL, NHD_AREA_URL].map((url) =>
+      queryWaterPolysIn(url, lat, lon, radiusDeg, where).catch(() => [])),
+  );
+  for (const batch of batches) {
+    for (const p of batch) {
+      // small inland ponds add vertices and no reachable water; marine tiles
+      // always count (a sliver at a river mouth can bridge to the open sea)
+      if (!isCoastalBody(p) && (p.area_sqkm || 0) < ow.domainMinSqKm) continue;
+      add(p);
+    }
+  }
+  // biggest first so domainMaxPolys keeps the water that matters
+  const polys = [...seen.values()]
+    .sort((a, b) => (b.area_sqkm || 0) - (a.area_sqkm || 0))
+    .slice(0, Math.max(1, ow.domainMaxPolys));
+  // ...but the click's own polygon must never be evicted by the cap
+  if (primary && !polys.some((p) => key(p) === key(primary))) polys[polys.length - 1] = primary;
+  for (const p of polys) p.bbox = ringsBbox(p.rings);
+  return polys;
+}
+
+/** True when (lat,lon) is inside ANY domain polygon. Per-polygon even-odd,
+ *  OR-ed — never flatten rings across features, which cancels overlaps. */
+export function pointInDomain(polys, lat, lon) {
+  for (const p of polys || []) {
+    const b = p.bbox;
+    if (b && (lon < b[0] || lon > b[2] || lat < b[1] || lat > b[3])) continue;
+    if (pointInRings(p.rings, lat, lon)) return true;
+  }
+  return false;
+}
+
+/**
+ * Classify every ring segment in the domain: a segment with domain water on
+ * its far side is an internal seam (an NHD tile boundary mid-water), not a
+ * shoreline. Probes seamProbeM to both sides of each segment midpoint; the
+ * side that lands inside the segment's OWN polygon is the water side and is
+ * skipped, so only the outward probe can flag a seam.
+ *
+ * Returns an array parallel to `rings`, each entry a Set of seam ordinals.
+ * Bbox-prefiltered: only segments that fall inside another polygon's envelope
+ * are ever tested, so the cost is proportional to seam length, not perimeter.
+ */
+export function markDomainSeams(polys, rings, ringOwner, seamProbeM = 150, coincidenceM = 80) {
+  const out = rings.map(() => null);
+  if (!polys || polys.length < 2) return out;
+  for (let ri = 0; ri < rings.length; ri++) {
+    const ring = rings[ri];
+    const owner = ringOwner[ri];
+    // which other polygons could possibly touch this ring?
+    const rb = ringsBbox([ring]);
+    const pad = 0.01;
+    const others = polys.filter((p, pi) => pi !== owner && p.bbox &&
+      !(rb[2] + pad < p.bbox[0] || rb[0] - pad > p.bbox[2] ||
+        rb[3] + pad < p.bbox[1] || rb[1] - pad > p.bbox[3]));
+    if (!others.length) continue;
+    const self = polys[owner];
+    let seams = null;
+    for (let i = 0; i + 1 < ring.length; i++) {
+      const [x1, y1] = ring[i], [x2, y2] = ring[i + 1];
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      const mLat = 111320, mLon = 111320 * Math.cos((my * Math.PI) / 180);
+      const dx = (x2 - x1) * mLon, dy = (y2 - y1) * mLat;
+      const L = Math.hypot(dx, dy);
+      if (!(L > 1e-6)) continue;
+      const px = -dy / L, py = dx / L; // unit perpendicular, metres
+      for (const s of [1, -1]) {
+        const tlon = mx + (s * px * seamProbeM) / mLon;
+        const tlat = my + (s * py * seamProbeM) / mLat;
+        if (pointInRings(self.rings, tlat, tlon)) continue; // water side of our own polygon
+        let hit = false;
+        for (const o of others) {
+          const b = o.bbox;
+          if (tlon < b[0] || tlon > b[2] || tlat < b[1] || tlat > b[3]) continue;
+          if (!pointInRings(o.rings, tlat, tlon)) continue;
+          // Guard against jumping a narrow land bridge. A genuine tile seam has
+          // the neighbour's edge coincident with this segment, or the neighbour
+          // overlaps it outright; a sand spit (Ediz Hook is 100-300 m wide) has
+          // the next water body a probe-length away across LAND, and dropping
+          // its shoreline would let particles pass straight through the spit.
+          if (pointInRings(o.rings, my, mx)) { hit = true; break; }        // overlapping
+          const nr = nearestOnRings(o.rings, my, mx);
+          if (nr && nr.dist_m <= coincidenceM) { hit = true; break; }      // abutting
+        }
+        if (hit) { (seams || (seams = new Set())).add(i); break; }
+      }
+    }
+    out[ri] = seams;
+  }
+  return out;
+}
+
+// ---- v1.11: OPEN BOUNDARIES (the data ends, the water does not) -------------
+//
+// NHD is US-only, so its marine polygons are clipped at the international
+// boundary. Treating that clip as shoreline beached ~90% of a mid-Strait plume
+// within 30 minutes and prescribed 37,750 ft of protective boom along the
+// US/Canada line. A segment on an open boundary is still a barrier to the
+// model — we have no Canadian hydrography — but a particle crossing it EXITS
+// the modeled domain and is reported as such, rather than being called beached.
+//
+// Geometry: NOAA "US Maritime Limits & Boundaries", layer 3, retrieved
+// 2026-09-14 from gis.charttools.noaa.gov (US Government, public domain).
+// B0098 = International Boundary Commission line through the Strait of Juan de
+// Fuca / Haro Strait / Boundary Pass; B0055 + B0058 = the Pacific approach
+// west of Cape Flattery (Federal Register Vol. 60 No. 163, 1995-08-23).
+export const BUILTIN_OPEN_BOUNDARIES = [
+  // B0098 (13 pts)
+  [[-123.0907,49.00206],[-123.32224,49.00207],[-123.00849,48.83122],[-123.00849,48.7671],[-123.26788,48.69399],
+   [-123.21893,48.54871],[-123.15987,48.45351],[-123.11514,48.42283],[-123.24844,48.28402],[-123.54122,48.22455],
+   [-123.67906,48.24],[-124.01206,48.29667],[-124.72725,48.49345]],
+  // B0055 (16 pts)
+  [[-124.72725,48.49345],[-124.75166,48.49721],[-124.77608,48.50096],[-124.7883,48.50284],[-124.81327,48.5043],
+   [-124.83824,48.50576],[-124.84053,48.5059],[-124.86557,48.50516],[-124.8906,48.50442],[-124.91564,48.50368],
+   [-124.91581,48.50367],[-124.94075,48.50206],[-124.96569,48.50044],[-124.98859,48.49895],[-125.00303,48.49534],
+   [-125.01506,48.492]],
+  // B0058 (20 pts)
+  [[-125.01506,48.492],[-125.02615,48.48891],[-125.04925,48.48248],[-125.07236,48.47604],[-125.09545,48.4696],
+   [-125.09776,48.46895],[-125.11959,48.4608],[-125.14143,48.45265],[-125.14165,48.45256],[-125.1547,48.44617],
+   [-125.17504,48.43647],[-125.19537,48.42675],[-125.21569,48.41704],[-125.23601,48.40732],[-125.25632,48.3976],
+   [-125.27662,48.38787],[-125.29691,48.37814],[-125.31719,48.36841],[-125.33747,48.35867],[-125.34407,48.3555]],
+];
+
+/** Shortest distance (m) from a point to a polyline, or Infinity. */
+function distToLineM(line, lat, lon) {
+  const mLat = 111320, mLon = 111320 * Math.cos((lat * Math.PI) / 180);
+  let best = Infinity;
+  for (let i = 0; i + 1 < line.length; i++) {
+    const ax = (line[i][0] - lon) * mLon, ay = (line[i][1] - lat) * mLat;
+    const bx = (line[i + 1][0] - lon) * mLon, by = (line[i + 1][1] - lat) * mLat;
+    const dx = bx - ax, dy = by - ay;
+    const L2 = dx * dx + dy * dy;
+    const t = L2 > 0 ? Math.max(0, Math.min(1, (-ax * dx - ay * dy) / L2)) : 0;
+    const d = Math.hypot(ax + t * dx, ay + t * dy);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * Flag ring segments that are the edge of the DATA rather than a shoreline.
+ * Same shape as markDomainSeams: an array parallel to `rings` of Sets.
+ *
+ * Two signals, OR-ed:
+ *
+ *  1. Within `tolM` of an authored boundary line (exact where we have one —
+ *     NHD's Haro Strait edge shares vertices with the NOAA boundary outright).
+ *
+ *  2. Segment longer than `minSegM`. NHD shoreline is digitized at 1:24k and
+ *     we request it at maxAllowableOffset 0.0003° (~30 m), so a multi-km
+ *     straight run means the source really is a straight line — a closure or
+ *     jurisdictional edge, never a digitized coast. Measured 2026-09-14:
+ *       Flathead Lake  1,271 segs, longest 1.23 km, none > 2 km
+ *       Lake Walcott     924 segs, longest 1.31 km, none > 2 km
+ *       Strait/Haro    1,569 segs, longest 22.69 km, 8 segs > 2 km (67 km)
+ *       W. Strait        654 segs, longest 28.87 km, 9 segs > 2 km (117 km)
+ *     This signal is what catches the western Strait of Juan de Fuca, where
+ *     NOAA's small-scale boundary line is ~9 km off the true NHD clip.
+ *
+ * Seam segments are dropped by owShorelineIndex before this flag is read, so a
+ * long segment that is really an internal tile join never reaches the model.
+ */
+export function markOpenBoundaries(rings, lines, tolM = 300, minSegM = 2000) {
+  const out = rings.map(() => null);
+  const use = lines && lines.length ? lines : [];
+  const pad = tolM / 80000; // generous degrees for the bbox prefilter
+  const boxes = use.map((l) => {
+    const b = ringsBbox([l]);
+    return [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad];
+  });
+  for (let ri = 0; ri < rings.length; ri++) {
+    const ring = rings[ri];
+    let open = null;
+    for (let i = 0; i + 1 < ring.length; i++) {
+      const [x1, y1] = ring[i], [x2, y2] = ring[i + 1];
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      let hit = false;
+      if (minSegM > 0) {
+        const mLon = 111320 * Math.cos((my * Math.PI) / 180);
+        hit = Math.hypot((x2 - x1) * mLon, (y2 - y1) * 111320) > minSegM;
+      }
+      for (let li = 0; !hit && li < use.length; li++) {
+        const b = boxes[li];
+        if (mx < b[0] || mx > b[2] || my < b[1] || my > b[3]) continue;
+        if (distToLineM(use[li], my, mx) <= tolM) hit = true;
+      }
+      if (hit) (open || (open = new Set())).add(i);
+    }
+    out[ri] = open;
+  }
+  return out;
+}
+
+/** Built-in boundaries plus any authored extras from config (docs or URLs). */
+async function loadOpenBoundaries(ow) {
+  const lines = [...BUILTIN_OPEN_BOUNDARIES];
+  for (const src of ow.openBoundaries || []) {
+    try {
+      const doc = typeof src === "string" ? await getJson(src, {}) : src;
+      for (const l of doc.lines || doc) if (Array.isArray(l) && l.length > 1) lines.push(l);
+    } catch { /* an unreachable extras file must not break the run */ }
+  }
+  return lines;
 }
 
 // ---- CO-OPS tidal-current predictions (Tier 3 coastal) ----------------------
@@ -2170,15 +2511,27 @@ function owSegIntersectT(ax, ay, bx, by, cx, cy, dx, dy) {
 }
 
 /** Uniform grid over shoreline segments; segments remember ring + ordinal so
- *  beached particles can be clustered into contiguous shoreline arcs. */
-function owShorelineIndex(ringsXY, cellM = 500) {
+ *  beached particles can be clustered into contiguous shoreline arcs.
+ *
+ *  v1.11 opts:
+ *    seams — per-ring Set of ordinals that are INTERNAL SEAMS (domain water on
+ *            the far side). Dropped entirely: they are not barriers at all.
+ *    open  — per-ring Set of ordinals that are OPEN BOUNDARIES (the data ends,
+ *            not the water). Kept as barriers but flagged, so a particle
+ *            crossing one exits the modeled domain instead of beaching.
+ */
+function owShorelineIndex(ringsXY, opts = {}) {
+  const { seams = null, open = null, cellM = 500 } = opts;
   const segs = [], segMeta = [];
   ringsXY.forEach((ring, ringIdx) => {
+    const seamSet = seams && seams[ringIdx];
+    const openSet = open && open[ringIdx];
     for (let i = 0; i < ring.length; i++) {
       const a = ring[i], b = ring[(i + 1) % ring.length];
       if (a[0] === b[0] && a[1] === b[1]) continue;
+      if (seamSet && seamSet.has(i)) continue; // not a shoreline — open water
       segs.push([a[0], a[1], b[0], b[1]]);
-      segMeta.push({ ring: ringIdx, ord: i });
+      segMeta.push({ ring: ringIdx, ord: i, open: !!(openSet && openSet.has(i)) });
     }
   });
   const cells = new Map();
@@ -2283,6 +2636,7 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
     P[i] = {
       x: x0, y: y0, beached: false, lastX: x0, lastY: y0,
       beachTMs: null, beachSeg: null,
+      exited: false, exitTMs: null, // v1.11: left the modeled domain
       windage: drawWindage(), windageAgeS: 0,
       pertF: 1, pertA: 0, pertAgeS: 0,
       curF: 1, curA: 0,
@@ -2301,14 +2655,22 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
 
   const hourly = [];
   const snapshot = (hr) => {
-    const pos = new Array(N);
-    let cx = 0, cy = 0, nb = 0;
+    // v1.11: particles that left the modeled domain are excluded from the hull
+    // and the centroid — the drawn plume is oil we are still modeling. The
+    // exited fraction is reported separately (stats.exited_* + a warning).
+    const pos = [];
+    let cx = 0, cy = 0, nb = 0, nx2 = 0, ne = 0;
     for (let i = 0; i < N; i++) {
-      pos[i] = [P[i].x, P[i].y];
-      cx += P[i].x; cy += P[i].y;
+      if (P[i].exited) { ne++; continue; }
+      pos.push([P[i].x, P[i].y]);
+      cx += P[i].x; cy += P[i].y; nx2++;
       if (P[i].beached) nb++;
     }
-    hourly.push({ hr, centroidXY: [cx / N, cy / N], beachedCount: nb, positions: pos });
+    hourly.push({
+      hr,
+      centroidXY: nx2 ? [cx / nx2, cy / nx2] : [x0, y0],
+      beachedCount: nb, exitedCount: ne, positions: pos,
+    });
   };
   snapshot(0);
 
@@ -2317,6 +2679,7 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
     const [wu0, wv0] = owWindAt(windSeries, tMs);
     for (let i = 0; i < N; i++) {
       const p = P[i];
+      if (p.exited) continue; // gone from the modeled domain — never comes back
       if (p.beached) {
         if (pRefloat > 0 && rng.next() < pRefloat) {
           p.beached = false; p.x = p.lastX; p.y = p.lastY;
@@ -2351,6 +2714,14 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
           const len = Math.hypot(nx - p.x, ny - p.y) || 1;
           p.x = hit.x - (nx - p.x) / len; // land 1 m short of the crossing
           p.y = hit.y - (ny - p.y) / len;
+          // v1.11: an OPEN boundary is the edge of the data, not a shore. The
+          // particle leaves the modeled domain — it is not beached, it does not
+          // refloat, and it must never generate a shoreline impact or boom.
+          if (index.segMeta[hit.idx] && index.segMeta[hit.idx].open) {
+            p.exited = true;
+            if (p.exitTMs === null) p.exitTMs = tMs + dt * 1000;
+            continue;
+          }
           p.beached = true;
           p.beachSeg = hit.idx;
           if (p.beachTMs === null) p.beachTMs = tMs + dt * 1000;
@@ -2373,17 +2744,49 @@ function owSimulate({ x0, y0, tMs0, windSeries, index, ow, uncertainty, seed, cu
 export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null, startOffsetHr = 0) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
+  const log = cfg.verbose ? (...a) => console.log(...a) : null;
   let wb = waterbody || (await queryWaterbody(lat, lon, config));
   // v1.10 rescue: impoundment stop points can land in NHD polygon gaps, or in
   // water that only exists as a lake/river-Area polygon nearby — search the
-  // area before giving up (the entry snap below handles landing outside it)
-  if (!wb) wb = await queryOpenWaterNear(lat, lon, config).catch(() => null);
+  // area before giving up (the entry snap below handles landing outside it).
+  // v1.11: the rescue also fires when the PIP hit is too small to model, so a
+  // sliver at the terminus can still be replaced by the real lake next door.
+  if (!acceptsOpenWater(wb, ow)) {
+    const near = await queryOpenWaterNear(lat, lon, config).catch(() => null);
+    if (acceptsOpenWater(near, ow)) wb = near;
+  }
   if (!wb) throw new Error("point is not inside an NHD waterbody");
+  // v1.11 gate: never run the particle model in a river channel. Without this a
+  // stale impoundment flag (removed dam) seeds a 1,000-particle plume inside a
+  // sub-km² river-Area sliver — observed on the Elwha at 0.14 km².
+  if (!acceptsOpenWater(wb, ow)) {
+    throw new Error(
+      `nearest mapped water (${wb.name}, ${Number(wb.area_sqkm || 0).toFixed(2)} km²) is a ` +
+      `river channel, not a lake or estuary — open-water model not applicable here`);
+  }
+  // v1.11: the simulation domain is every water polygon near the run, not just
+  // the one the click landed in — see queryWaterDomain / markDomainSeams.
+  const domain = await queryWaterDomain(lat, lon, config, wb).catch(() => [wb]);
+  const domainRings = [];
+  const domainRingOwner = [];
+  domain.forEach((p, pi) => p.rings.forEach((r) => {
+    domainRings.push(r); domainRingOwner.push(pi);
+  }));
+  const domainSeams = markDomainSeams(domain, domainRings, domainRingOwner,
+    ow.seamProbeM, ow.seamCoincidenceM);
+  const domainOpen = markOpenBoundaries(domainRings, await loadOpenBoundaries(ow),
+    ow.openBoundaryTolM, ow.openBoundaryMinSegM);
+  if (log) {
+    const nSeam = domainSeams.reduce((a, s) => a + (s ? s.size : 0), 0);
+    const nOpen = domainOpen.reduce((a, s) => a + (s ? s.size : 0), 0);
+    log(`  domain: ${domain.length} water polygon(s), ${domainRings.length} rings, ` +
+      `${nSeam} internal seam segment(s), ${nOpen} open-boundary segment(s)`);
+  }
   // continuation entries can sit outside the polygon (river network ends on
   // unnetworked delta/flats) — starting particles outside would beach them on
   // the wrong side of the shoreline instantly, so snap just inside instead
   let entrySnapM = 0;
-  if (!pointInRings(wb.rings, lat, lon)) {
+  if (!pointInDomain(domain, lat, lon)) {
     const near = nearestOnRings(wb.rings, lat, lon);
     if (!near) throw new Error("entry point outside waterbody and no shoreline found");
     const stepM = 40;
@@ -2397,14 +2800,13 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
       { lat: near.lat + stepM / mLat, lon: near.lon }, { lat: near.lat - stepM / mLat, lon: near.lon },
       { lat: near.lat, lon: near.lon + stepM / mLon }, { lat: near.lat, lon: near.lon - stepM / mLon },
     ];
-    const inW = cands.find((c) => pointInRings(wb.rings, c.lat, c.lon));
+    const inW = cands.find((c) => pointInDomain(domain, c.lat, c.lon));
     if (!inW) throw new Error("could not find open water near the terminus");
     entrySnapM = Math.round(near.dist_m + stepM);
     lat = inW.lat; lon = inW.lon;
   }
   const startTMs = Date.now() + startOffsetHr * 3600000;
   const coastal = isCoastalBody(wb);
-  const log = cfg.verbose ? (...a) => console.log(...a) : null;
   const windP = fetchWindSeries(lat, lon, startOffsetHr + ow.durationHr);
   // coastal: blended tidal-current field from the nearest prediction stations
   let stationsP = Promise.resolve([]);
@@ -2422,6 +2824,9 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   );
   return {
     lat, lon, waterbody: wb, coastal, entrySnapM,
+    // v1.11 domain. `waterbody` stays the click's own polygon so existing
+    // callers (terminal_waterbody, runRecord, the widget) are unaffected.
+    domain, domainRings, domainRingOwner, domainSeams, domainOpen,
     windSeries: wind.series, windSource: wind.source,
     currentStations,
     siteSets, receptorSets,
@@ -2452,8 +2857,13 @@ export function computeOpenWater(data, config = {}) {
   const log = (m) => ({ ...DEFAULT_CONFIG, ...config }).verbose && console.log(m);
   const t0 = Date.now();
   const proj = owProjection(data.lat, data.lon);
-  const ringsXY = data.waterbody.rings.map((r) => r.map(([lo, la]) => proj.toXY(la, lo)));
-  const index = owShorelineIndex(ringsXY);
+  // v1.11: simulate against the whole domain, minus internal seams. Pre-1.11
+  // data (or a synthetic test fixture) carries no domain — fall back to the
+  // single polygon so old callers and fixtures keep working.
+  const simRings = data.domainRings || data.waterbody.rings;
+  const seams = data.domainSeams || null;
+  const ringsXY = simRings.map((r) => r.map(([lo, la]) => proj.toXY(la, lo)));
+  const index = owShorelineIndex(ringsXY, { seams, open: data.domainOpen || null });
 
   // coastal tidal-current field: inverse-distance-squared blend of the
   // station vectors (100 m floor keeps a click on top of a station finite)
@@ -2495,6 +2905,7 @@ export function computeOpenWater(data, config = {}) {
       centroid: { lat: Math.round(cla * 1e6) / 1e6, lon: Math.round(clo * 1e6) / 1e6 },
       hull: toLatLonRing(convexHull(h.positions)),
       beached_count: h.beachedCount,
+      exited_count: h.exitedCount || 0,
     };
   });
   const uncertaintyHourly = regret.hourly.filter((h) => h.hr > 0).map((h) => ({
@@ -2514,7 +2925,7 @@ export function computeOpenWater(data, config = {}) {
   const impacts = [];
   for (const [ringIdx, hits] of byRing) {
     hits.sort((a, b) => a.ord - b.ord);
-    const ring = data.waterbody.rings[ringIdx];
+    const ring = simRings[ringIdx]; // v1.11: indices are into the whole domain
     let cl = null;
     const flush = () => { if (cl) { impacts.push(cl); cl = null; } };
     for (const h of hits) {
@@ -2636,6 +3047,22 @@ export function computeOpenWater(data, config = {}) {
       `Open-water entry snapped ~${(data.entrySnapM / 1000).toFixed(1)} km from the river terminus ` +
       `across unnetworked delta/flats — nearshore arrival times are approximate.`);
   }
+  // v1.11: plume reaching the edge of the modeled world (US/Canada line)
+  const exitedParts = best.particles.filter((p) => p.exitTMs !== null);
+  const exitedPct = Math.round((1000 * exitedParts.length) / ow.nParticles) / 10;
+  const firstExitHr = exitedParts.length
+    ? Math.round(Math.min(...exitedParts.map((p) => (p.exitTMs - data.startTMs) / 3600000)) * 10) / 10
+    : null;
+  if (exitedParts.length) {
+    warnings.push(
+      `${exitedPct}% of the modeled plume reached the edge of the mapped area ` +
+      `(an international boundary or the limit of NHD hydrography) at ` +
+      `${(data.startOffsetHr + firstExitHr).toFixed(1)} h from the spill. Transport beyond ` +
+      `that line is NOT modeled: those particles leave the simulation rather than coming ` +
+      `ashore, so shoreline impacts and boom beyond it are NOT estimated. This edge is an ` +
+      `information limit, not a barrier — for transboundary water notify the Canadian Coast ` +
+      `Guard / ECCC (or the relevant neighbouring authority) and plan past it.`);
+  }
 
   const result = {
     mode: "open-water",
@@ -2654,6 +3081,10 @@ export function computeOpenWater(data, config = {}) {
       n_particles: ow.nParticles,
       beached_final: best.particles.filter((p) => p.beached).length,
       ever_beached: best.particles.filter((p) => p.beachTMs !== null).length,
+      exited_count: exitedParts.length,
+      exited_pct: exitedPct,
+      first_exit_hr: firstExitHr,
+      domain_polys: (data.domain || []).length || 1,
       compute_ms: Date.now() - t0,
     },
     runRecord: {
@@ -2678,6 +3109,7 @@ export function computeOpenWater(data, config = {}) {
     },
   };
   log(`  OPEN WATER: ${data.waterbody.name} — ${result.stats.ever_beached}/${ow.nParticles} beached, ` +
+    `${result.stats.exited_count}/${ow.nParticles} exited the domain, ` +
     `${shoreImpacts.length} shore impacts, ${sites.length} sites, ${result.stats.compute_ms} ms`);
   return result;
 }
