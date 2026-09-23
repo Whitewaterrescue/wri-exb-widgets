@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.11.0";
+export const ENGINE_VERSION = "1.12.0";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -85,6 +85,36 @@ export function excludedImpoundments(cfg) {
   return new Set([...REMOVED_IMPOUNDMENT_COMIDS, ...(cfg.impoundExcludeComids || [])]);
 }
 
+/**
+ * Channel reroutes (v1.12). NHDPlus MR's main path (divergence=1) is sometimes the WRONG
+ * channel: at New Harmony IN the main path is the ~13 km dry historic meander ("Wabash River
+ * Old Channel") and the live river is the 3.30 km divergence=2 cutoff 10382133. NLDI DM
+ * navigation follows the main path, so the DM comid set is spliced: `drop` leaves, `add`
+ * joins with geometry + VAAs from the same vaaBatch call. Ordering needs no special code:
+ * assembleTrace sorts by hydroseq and NHDPlus guarantees hydroseq(split) > hydroseq(add) >
+ * hydroseq(rejoin) on every downstream path, main or minor -- the splice checks it anyway
+ * and restores the main path if the check fails. Extendable per-run via config.reroutes;
+ * config.applyReroutes=false gives the raw NLDI path (before/after tests).
+ */
+export const CHANNEL_REROUTES = [
+  {
+    id: "new-harmony-cutoff",
+    name: "New Harmony cutoff",
+    river: "Wabash River, IL/IN",
+    note: "Confirmed live 2026-09-23. USGS 03378500 is indexed to the split comid and stays on the trace.",
+    split: 10382125,   // last shared comid above the divergence (DA 75,586 km2)
+    rejoin: 10382139,  // first shared comid below (hydroseq 430001319)
+    drop: [10382127, 10381745, 10381761, 10382129, 10382131, 935120060, 935120059,
+           10383145, 10382141, 10381785, 10382135],
+    add: [10382133],   // divergence 2, streamorde 4, 3.30 km, hydroseq 430001367
+  },
+];
+
+/** Reroutes for this run: the built-in table plus per-run additions (none when disabled). */
+export function activeReroutes(cfg) {
+  return cfg.applyReroutes === false ? [] : [...CHANNEL_REROUTES, ...(cfg.reroutes || [])];
+}
+
 export const DEFAULT_CONFIG = {
   maxDistanceKm: 300,
   maxHours: 24,
@@ -102,6 +132,11 @@ export const DEFAULT_CONFIG = {
   gaugeStatFallback: true,    // gauge IV feed down -> period-of-record median daily flow (Payton's get_discharge pattern)
   impoundStopKm: 2.0,
   impoundExcludeComids: [],   // extra removed-dam comids beyond REMOVED_IMPOUNDMENT_COMIDS
+  reroutes: [],               // extra channel reroutes (CHANNEL_REROUTES shape), v1.12
+  applyReroutes: true,        // false = raw NLDI DM path (before/after comparisons)
+  snapPreferM: 300,           // prefer a main-path / highest-order reach within this of the click
+  snapMetric: "segment",      // 'segment' (point-to-segment) | 'vertex' (v1.0: every 3rd vertex; parity fixtures)
+  jobsonQaMinSpecificRatio: 0.2, // EROM rows below this x trace-median specific flow are rebuilt (side channels)
   corridors: [],              // corridor docs or URLs (Canadian rivers, see corridors/)
   corridorGapMaxM: 2000,      // max confluence gap bridged when chaining corridors
   timingModel: "hydraulic",   // 'hydraulic' (V=Q/A x safety) | 'jobson' (USGS WRIR 96-4013 dye-study regressions)
@@ -265,8 +300,32 @@ async function getText(url, params, timeoutMs = 30000) {
 
 // ---------------------------------------------------------------- data fetch
 
-/** Snap to nearest reach with streamorde >= minOrder (geoserver bbox search). */
-async function snapComid(lat, lon, minOrder) {
+/**
+ * Rank snap candidates (v1.12, pure -- unit-tested). Within `preferM` of the click prefer a
+ * main-path reach (divergence != 2), then the highest stream order, then the nearest; beyond
+ * `preferM` the nearest wins as before. A big river's parallel side channel carries the full
+ * main-stem DA but ~1% of the EROM flow (Wabash at Grayville: order 4, qe_ma 309 vs 31,538),
+ * which inflated Jobson velocities 5x for the first 11 km when a mid-channel click snapped to
+ * it. `bypassed` = reroute drop comids (a dry channel is never a spill start); `restored` =
+ * reroute add comids, treated as main path even though NHDPlus flags them divergence=2.
+ */
+export function rankSnapCandidates(cands, preferM, bypassed = new Set(), restored = new Set()) {
+  const live = cands.filter((c) => !bypassed.has(Number(c.comid)));
+  if (!live.length) return null;
+  live.sort((a, b) => a.d - b.d);
+  const nearest = live[0];
+  const near = live.filter((c) => c.d <= (preferM || 0));
+  if (near.length < 2) return { pick: nearest, alt: null };
+  const minor = (c) => (Number(c.divergence) === 2 && !restored.has(Number(c.comid)) ? 1 : 0);
+  near.sort((a, b) => (minor(a) - minor(b))
+    || ((b.streamorde ?? 0) - (a.streamorde ?? 0))
+    || (a.d - b.d));
+  return { pick: near[0], alt: near[0].comid !== nearest.comid ? nearest : null };
+}
+
+/** Snap to a reach with streamorde >= minOrder (geoserver bbox search); v1.12 measures
+ *  point-to-segment distance and prefers the main channel (see rankSnapCandidates). */
+async function snapComid(lat, lon, minOrder, opts = {}) {
   const box = 0.2;
   // NOTE: EPSG:4269 under WFS 2.0 uses lat,lon axis order in CQL BBOX
   const j = await getJson(GEOSERVER, {
@@ -279,20 +338,39 @@ async function snapComid(lat, lon, minOrder) {
       count: "500",
     },
   });
-  let best = null, bestD = Infinity;
+  const cands = [];
   for (const f of j.features || []) {
     const g = f.geometry;
+    if (!g) continue;
     const paths = g.type === "LineString" ? [g.coordinates] : g.coordinates;
-    for (const path of paths) {
-      for (let i = 0; i < path.length; i += 3) { // every 3rd vertex
-        const p = path[i];
-        const d = haversineM(lat, lon, p[1], p[0]);
-        if (d < bestD) { bestD = d; best = f.properties; }
-      }
+    let near;
+    if (opts.metric === "vertex") {
+      // v1.0 metric, kept for the parity fixtures (the Python oracle samples vertices):
+      // on a long straight MR reach this can miss the truly nearest reach by kilometres.
+      let d = Infinity;
+      for (const path of paths) for (let i = 0; i < path.length; i += 3) d = Math.min(d, haversineM(lat, lon, path[i][1], path[i][0]));
+      near = Number.isFinite(d) ? { dist_m: d } : null;
+    } else {
+      near = nearestOnRings(paths, lat, lon); // point-to-segment, not every-3rd-vertex
     }
+    if (!near) continue;
+    const p = f.properties;
+    cands.push({ comid: Number(p.comid), gnis_name: p.gnis_name ?? null,
+                 streamorde: p.streamorde ?? null, divergence: p.divergence ?? 0, d: near.dist_m });
   }
-  if (best !== null) return [Number(best.comid), best.gnis_name ?? null, bestD];
-  return [await nldiPositionComid(lat, lon), null, null];
+  const ranked = rankSnapCandidates(cands, opts.preferM ?? 0, opts.bypassed, opts.restored);
+  if (ranked) {
+    const { pick, alt } = ranked;
+    const altInfo = alt ? { comid: alt.comid, streamorde: alt.streamorde, divergence: alt.divergence,
+                            dist_m: Math.round(alt.d) } : null;
+    if (alt && opts.log) {
+      opts.log(`  snap: preferred comid ${pick.comid} (order ${pick.streamorde}, div ${pick.divergence}, `
+        + `${Math.round(pick.d)} m) over nearest ${alt.comid} (order ${alt.streamorde}, div ${alt.divergence}, `
+        + `${Math.round(alt.d)} m)`);
+    }
+    return [pick.comid, pick.gnis_name, pick.d, altInfo];
+  }
+  return [await nldiPositionComid(lat, lon), null, null, null];
 }
 
 async function nldiPositionComid(lat, lon) {
@@ -383,6 +461,12 @@ async function vaaBatch(comids) {
     });
     for (const f of j.features || []) {
       const p = f.properties;
+      // geometry kept (v1.12) so a reroute can splice a reach that NLDI DM never returned;
+      // same [paths] shape as nldiDmFlowlines ([[lon,lat],...] per path)
+      const g = f.geometry;
+      const geom = !g ? null
+        : g.type === "LineString" ? [g.coordinates]
+        : g.type === "MultiLineString" ? g.coordinates : null;
       // EROM monthly modeled flow (gauge-adjusted, cfs) — ungauged fallback + Jobson Qa
       const qe = {};
       for (let m = 1; m <= 12; m++) {
@@ -404,6 +488,7 @@ async function vaaBatch(comids) {
         qe_monthly: qe,
         // NHDPlus divergence: 0 = none, 1 = main path, 2 = minor path of a split
         divergence: p.divergence ?? 0,
+        geom,
       });
     }
   }
@@ -446,7 +531,10 @@ async function gaugeInfo(stationIds, asOf = null, statFallback = false) {
   if (asOf) { params.startDT = asOf; params.endDT = asOf; }
   else params.period = "P1D";
   try {
-    const j = await getJson(NWIS_IV, { params, timeoutMs: 60000, tries: 1 });
+    // v1.12: two attempts, not one. Back-to-back traces (validation suites, a responder
+    // re-clicking) hit NWIS throttling; a single failed attempt silently dropped EVERY gauge
+    // and the run fell to the no-gauge EROM path with no warning.
+    const j = await getJson(NWIS_IV, { params, timeoutMs: 60000, tries: 2 });
     for (const ts of j?.value?.timeSeries || []) {
       const sid = ts.sourceInfo.siteCode[0].value;
       const vals = ts.values[0].value;
@@ -554,6 +642,7 @@ function assembleTrace(lat, lon, geoms, vaa, resolutionM, log) {
         gnis_name: s.gnis_name,
         qe_ma: s.qe_ma, qe_monthly: s.qe_monthly,
         divergence: s.divergence || 0,
+        streamorde: s.streamorde ?? null,
       });
     }
   }
@@ -1077,11 +1166,47 @@ export async function fetchTraceData(lat, lon, config = {}) {
   }
 
   // 1. trace geometry (one NLDI call) + VAA batch join
-  const [comid, snapName, snapD] = await snapComid(lat, lon, cfg.minStreamOrder);
+  const rr = activeReroutes(cfg);
+  const [comid, snapName, snapD, snapAlt] = await snapComid(lat, lon, cfg.minStreamOrder, {
+    preferM: cfg.snapPreferM, metric: cfg.snapMetric, log,
+    bypassed: new Set(rr.flatMap((r) => r.drop)), restored: new Set(rr.flatMap((r) => r.add)),
+  });
   log(`  COMID ${comid}` + (snapName ? ` (${snapName}, snapped ${(snapD / 1000).toFixed(2)} km)` : ""));
   const geoms = await nldiDmFlowlines(comid, cfg.maxDistanceKm);
   log(`  NLDI DM flowlines: ${geoms.size}`);
-  const vaa = await vaaBatch([...geoms.keys()]);
+
+  // 1b. channel reroutes (v1.12) -- drop the wrong channel BEFORE the VAA batch, fetch the
+  // right one's geometry + VAAs in that same batch, splice, then let assembleTrace order by
+  // hydroseq. Fail-safe: any doubt about order or geometry restores the MR main path.
+  const pending = [];
+  for (const r of rr) {
+    const hit = r.drop.filter((c) => geoms.has(c));
+    if (!hit.length) continue;                       // the trace never enters this bypass
+    if (r.drop.includes(comid)) {
+      log(`  reroute skipped: ${r.name} -- start comid ${comid} is on the bypassed reach`);
+      continue;
+    }
+    const removed = new Map(hit.map((c) => [c, geoms.get(c)]));
+    for (const c of hit) geoms.delete(c);
+    pending.push({ r, removed, hit });
+  }
+  const vaa = await vaaBatch([...geoms.keys(), ...pending.flatMap((p) => p.r.add)]);
+  const reroutes = [];
+  for (const { r, removed, hit } of pending) {
+    const hs = (c) => (vaa.get(c) && vaa.get(c).hydroseq != null ? vaa.get(c).hydroseq : null);
+    const okGeom = r.add.every((c) => vaa.get(c) && vaa.get(c).geom && vaa.get(c).geom.length);
+    const okOrder = r.add.every((c) => hs(c) !== null
+      && (hs(r.split) === null || hs(c) < hs(r.split))
+      && (hs(r.rejoin) === null || hs(c) > hs(r.rejoin)));
+    if (!okGeom || !okOrder) {
+      for (const [c, g] of removed) geoms.set(c, g);
+      log(`  reroute NOT applied: ${r.name} -- ${okGeom ? "hydroseq order check failed" : "added comid geometry missing"}; MR main path kept`);
+      continue;
+    }
+    for (const c of r.add) geoms.set(c, vaa.get(c).geom);
+    reroutes.push({ id: r.id, name: r.name, dropped: hit.length, added: r.add.length });
+    log(`  reroute applied: ${r.name}, -${hit.length} comids +${r.add.length}`);
+  }
   const [pts, riverName] = assembleTrace(lat, lon, geoms, vaa, cfg.resolutionM, log);
   if (pts.length < 2) throw new Error("trace too short");
 
@@ -1285,8 +1410,8 @@ export async function fetchTraceData(lat, lon, config = {}) {
   } catch (e) { log(`  terminal open-water probe failed (${String(e).slice(0, 60)}) - trace unaffected`); }
 
   return {
-    lat, lon, comid, snapName, snapDistM: snapD, riverName,
-    rows, gd, siteSets, receptorSets, terminalWater,
+    lat, lon, comid, snapName, snapDistM: snapD, snapAlt: snapAlt || null, riverName,
+    rows, gd, siteSets, receptorSets, terminalWater, reroutes,
     asOf: cfg.asOf || "live",
     fetchedAt: new Date().toISOString(),
   };
@@ -1325,6 +1450,47 @@ export function jobsonPassageHours(tpHours, qPrime) {
   return 2e6 / cup / 3600;
 }
 
+/**
+ * EROM Qa sanitization (v1.12). EROM flow (qe_ma, qe_01..12) is divergence-routed while
+ * totdasqkm is not: a minor-path side channel carries the full main-stem drainage area with
+ * ~1% of the flow. Jobson's velocity uses Da^1.25/Qa, so that row runs ~8x too fast; the
+ * no-gauge EROM Q path has the same defect inverted (Q 100x low -> far too slow). Specific
+ * flow (cfs per km2) along one downstream path cannot legitimately drop 5x between rows, so
+ * rows below `minRatio` x the trace median (median over main-path rows) get Qa := median x DA
+ * and their monthly EROM scaled by the same factor. Raw qe_ma / qe_monthly are never
+ * overwritten (computeTrace must stay idempotent on cached data); results land in qa_cfs,
+ * qe_month_cfs, qa_sanitized. Rows with DA but no EROM at all are filled the same way.
+ */
+export function sanitizeEromQa(rows, month, minRatio = 0.2, log = () => {}) {
+  const spec = (r) => (r.qe_ma > 0 && r.drainage_area_km2 > 0 ? r.qe_ma / r.drainage_area_km2 : null);
+  const raw = (r) => {
+    r.qa_cfs = r.qe_ma > 0 ? r.qe_ma : null;
+    const qm = r.qe_monthly ? r.qe_monthly[month] : null;
+    r.qe_month_cfs = qm > 0 ? qm : null;
+    r.qa_sanitized = false;
+  };
+  const ref = rows.filter((r) => Number(r.divergence) !== 2 && spec(r) !== null).map(spec).sort((a, b) => a - b);
+  if (ref.length < Math.max(10, rows.length * 0.2)) { rows.forEach(raw); return { n: 0, medianSpec: null, nDiv: 0 }; }
+  const med = ref[ref.length >> 1];
+  let n = 0, nDiv = 0, nNone = 0;
+  for (const r of rows) {
+    const sp = spec(r);
+    if (!(r.drainage_area_km2 > 0) || (sp !== null && sp >= minRatio * med)) { raw(r); continue; }
+    const qa = med * r.drainage_area_km2;
+    const k = r.qe_ma > 0 ? qa / r.qe_ma : null;
+    const qm = r.qe_monthly ? r.qe_monthly[month] : null;
+    r.qa_cfs = qa;
+    r.qe_month_cfs = (k !== null && qm > 0) ? qm * k : qa;
+    r.qa_sanitized = true;
+    n++; if (Number(r.divergence) === 2) nDiv++; if (sp === null) nNone++;
+  }
+  if (n) {
+    log(`  EROM Qa sanitized: ${n}/${rows.length} rows (${nDiv} divergence=2, ${nNone} no EROM) -- `
+      + `specific flow < ${minRatio} x trace median ${med.toFixed(4)} cfs/km2; Qa := median x DA`);
+  }
+  return { n, medianSpec: med, nDiv };
+}
+
 export function computeTrace(data, config = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const log = cfg.verbose ? (...a) => console.log(...a) : () => {};
@@ -1336,6 +1502,8 @@ export function computeTrace(data, config = {}) {
   const eromMonth = data.asOf && data.asOf !== "live"
     ? parseInt(data.asOf.slice(5, 7), 10)
     : new Date().getMonth() + 1;
+  // 5a. side-channel guard on EROM before anything reads it (v1.12)
+  const qaSan = sanitizeEromQa(rows, eromMonth, cfg.jobsonQaMinSpecificRatio, log);
 
   let qMethod, qConfidence;
   const anchored = gd.some((g) => g.upstream_anchor);
@@ -1374,10 +1542,10 @@ export function computeTrace(data, config = {}) {
   } else {
     // EROM per-reach monthly modeled flow (gauge-adjusted; captures seasonal
     // yield — Montana June vs September differs ~5x) before the flat constant
-    const eromOk = rows.filter((r) => r.qe_monthly && r.qe_monthly[eromMonth] > 0).length;
+    const eromOk = rows.filter((r) => r.qe_month_cfs > 0).length;
     if (eromOk >= rows.length * 0.8) {
       for (const r of rows) {
-        const qe = r.qe_monthly ? r.qe_monthly[eromMonth] : null;
+        const qe = r.qe_month_cfs;  // sanitized (v1.12): side channels carry the main-stem yield
         r.Q_cfs = Math.max(qe > 0 ? qe : r.drainage_area_sqmi * 2.0, 1.0);
       }
       qMethod = `erom-monthly (month ${eromMonth})`; qConfidence = "MODERATE — modeled flow, no live gauge";
@@ -1441,7 +1609,7 @@ export function computeTrace(data, config = {}) {
     r.cum_time = cumT / 3600; // hydraulic (x safety) — always computed; feeds legacy mode
     if (jobson) {
       const daM2 = (r.drainage_area_km2 || 0) * 1e6;
-      const QaM3s = r.qe_ma > 0 ? r.qe_ma / CFS : null;
+      const QaM3s = r.qa_cfs > 0 ? r.qa_cfs / CFS : null;  // sanitized EROM Qa (v1.12)
       const jv = QaM3s ? jobsonVelocities(daM2, r.Q_m3s, QaM3s, r.slope) : null;
       let vp, vmp, qPrime;
       if (jv) { ({ vp, vmp, qPrime } = jv); }
@@ -1675,7 +1843,9 @@ export function computeTrace(data, config = {}) {
     generated_at: new Date().toISOString(),
     data_fetched_at: data.fetchedAt || null,
     spill_point: { lat: data.lat, lon: data.lon },
-    snap: { comid, river: riverName, snapped_from_m: data.snapDistM !== undefined ? Math.round(data.snapDistM || 0) : null },
+    snap: { comid, river: riverName, snapped_from_m: data.snapDistM !== undefined ? Math.round(data.snapDistM || 0) : null,
+            alternative: data.snapAlt || null },
+    channel_reroutes: data.reroutes || [],
     timing_model: cfg.timingModel,
     safety_factor: cfg.safetyFactor,
     max_hours: cfg.maxHours,
@@ -1696,6 +1866,8 @@ export function computeTrace(data, config = {}) {
     erom_month: qMethod.startsWith("erom") ? eromMonth : null,
     width_source: { glow_matched_points: glowMatched, total_points: rows.length, braided_points_formula_width: braidedN },
     jobson_degraded_points: jobson ? jobsonDegraded : null,
+    erom_qa_sanitized_points: qaSan.n,
+    erom_median_specific_flow_cfs_km2: qaSan.medianSpec,
     impound_exclusions_applied: [...excluded].filter((c) => rows.some((r) => r.comid === c)),
     impound_stop_km: stopIdx !== null ? Math.round(rows[stopIdx].cum_dist / 100) / 10 : null,
     coastal_stop: coastalStopPoint ? { ...coastalStopPoint } : null,
