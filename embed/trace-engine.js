@@ -30,7 +30,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.12.0";
+export const ENGINE_VERSION = "1.12.1";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -1919,7 +1919,17 @@ export function computeTrace(data, config = {}) {
 export async function resolveTraceMode(lat, lon, config = {}) {
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
   if (!ow.enabled) return { mode: "river" };
-  const wb = await queryWaterbody(lat, lon, config);
+  // v1.12.1: the National Map NHD waterbody probe is a DISPATCH hint, not a dependency.
+  // hydro.nationalmap.gov answered 504 for hours on 2026-09-23 and every trace click died
+  // here before NLDI was even asked. If the probe fails, run the river model (a lake click
+  // degrades to a river trace and says so) instead of failing the whole trace.
+  let wb;
+  try {
+    wb = await queryWaterbody(lat, lon, config);
+  } catch (e) {
+    return { mode: "river", waterbody: null,
+             probe_failed: `NHD waterbody probe unavailable (${String(e && e.message || e).slice(0, 90)}); river mode assumed` };
+  }
   const lakeHit = wb && isOpenWaterBody(wb) && wb.area_sqkm >= ow.minLakeSqKm;
   // v1.10: large FTYPE 460 river-Area polygons are estuaries in practice on
   // the Great Lakes (St. Louis Bay, Duluth) — same tiebreak below guards
@@ -1942,6 +1952,7 @@ export async function runTrace(lat, lon, config = {}) {
   if (disp.mode === "open-water") return runOpenWater(lat, lon, config, disp.waterbody);
   const data = await fetchTraceData(lat, lon, config);
   const result = computeTrace(data, config);
+  if (disp.probe_failed) result.warnings.push(disp.probe_failed);
   if (ow.enabled && ow.continueAtImpoundment && (result.impound_stop_point || result.coastal_stop_point)) {
     try {
       result.open_water = await runOpenWaterContinuation(result, config);
