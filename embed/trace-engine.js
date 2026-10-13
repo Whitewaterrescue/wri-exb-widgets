@@ -18,6 +18,8 @@
  *   4. width override sampled in windows; failure degrades to formula widths
  *   5. NLDI/geoserver empty-200 -> retry 3x with backoff
  *   6. snap click to streamorde >= minStreamOrder
+ *   7. National Map NHD polygons: 15 s budget + 5-min breaker + NHDPlus MR
+ *      mirror on the USGS geoserver (v1.12.2) — see nhdFeatures()
  *
  * Corridor mode (v1.6): US federal services (NLDI/NHDPlus/NWIS) end at the
  * border. config.corridors lists precomputed corridor files (see
@@ -30,7 +32,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.12.1";
+export const ENGINE_VERSION = "1.12.2";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -253,6 +255,15 @@ export function calculateDepthManning(Qm3s, widthM, slope, n = 0.045) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** v1.12.2: optional UI hook — config.onProgress(message) fires at each network phase
+ *  so a widget can say what it is waiting on instead of spinning silently. Never throws,
+ *  never affects results. */
+function progressFn(cfg) {
+  const f = cfg && cfg.onProgress;
+  if (typeof f !== "function") return () => {};
+  return (msg) => { try { f(msg); } catch { /* a UI hook must never break a trace */ } };
+}
 
 /** GET/POST with retry — NLDI/geoserver intermittently return empty 200 bodies. */
 async function getJson(url, { params = null, data = null, tries = 3, timeoutMs = 90000 } = {}) {
@@ -1147,12 +1158,15 @@ async function fetchCorridorTraceData(lat, lon, corr, allCorridors, cfg, log) {
 export async function fetchTraceData(lat, lon, config = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const log = cfg.verbose ? (...a) => console.log(...a) : () => {};
+  const progress = progressFn(cfg);
+  const nhdHits0 = nhdState.mirrorHits;
 
   log(`fetchTraceData(${lat.toFixed(4)}, ${lon.toFixed(4)})  asOf=${cfg.asOf || "live"}`);
 
   // 0. corridor mode (v1.6): if the click lands on a configured corridor
   // (Canadian rivers — no NLDI/NHDPlus/NWIS coverage), run on corridor data.
   if (cfg.corridors && cfg.corridors.length) {
+    progress("Loading corridor files…");
     const docs = await loadCorridors(cfg.corridors, log);
     let best = null;
     for (const c of docs) {
@@ -1167,11 +1181,13 @@ export async function fetchTraceData(lat, lon, config = {}) {
 
   // 1. trace geometry (one NLDI call) + VAA batch join
   const rr = activeReroutes(cfg);
+  progress("Locating the nearest reach (USGS NLDI / geoserver)…");
   const [comid, snapName, snapD, snapAlt] = await snapComid(lat, lon, cfg.minStreamOrder, {
     preferM: cfg.snapPreferM, metric: cfg.snapMetric, log,
     bypassed: new Set(rr.flatMap((r) => r.drop)), restored: new Set(rr.flatMap((r) => r.add)),
   });
   log(`  COMID ${comid}` + (snapName ? ` (${snapName}, snapped ${(snapD / 1000).toFixed(2)} km)` : ""));
+  progress(`Walking the downstream network from ${snapName || "comid " + comid} (USGS NLDI)…`);
   const geoms = await nldiDmFlowlines(comid, cfg.maxDistanceKm);
   log(`  NLDI DM flowlines: ${geoms.size}`);
 
@@ -1190,6 +1206,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     for (const c of hit) geoms.delete(c);
     pending.push({ r, removed, hit });
   }
+  progress(`Joining reach attributes for ${geoms.size} reaches (USGS geoserver)…`);
   const vaa = await vaaBatch([...geoms.keys(), ...pending.flatMap((p) => p.r.add)]);
   const reroutes = [];
   for (const { r, removed, hit } of pending) {
@@ -1242,6 +1259,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
   }
 
   if (cfg.widthProvider) {
+    progress("Sampling channel widths (width override layer)…");
     // HR NHDPlusID != MR comid — sample spatially, in windows; never let the
     // override kill the run (degrade to formula widths).
     let mids = [];
@@ -1293,6 +1311,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
   }
 
   // 3. discharge inputs: NLDI downstream gauges -> NWIS Q (+DA), located on trace
+  progress("Finding downstream gauges (USGS NLDI)…");
   const gauges = await nldiGauges(comid, cfg.maxDistanceKm, "DM");
   // upstream-anchor candidates: nearest UM gauges (fixes the discontinuity when
   // the click is just below a gauge and DM navigation no longer sees it)
@@ -1310,6 +1329,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     }
   }
   const allIds = [...new Set([...gauges, ...upCands].map((g) => g.station_id))];
+  progress(`Reading live flows at ${allIds.length} gauge(s) (USGS NWIS)…`);
   const ginfo = await gaugeInfo(allIds, cfg.asOf, cfg.gaugeStatFallback);
   const gd = [];
   for (const g of gauges) {
@@ -1361,6 +1381,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
   }
 
   // 4. site/receptor features (fetched in parallel; joined in computeTrace)
+  progress("Loading strategy sites and receptors…");
   const fetchSets = async (providers) => Promise.all(
     (providers || []).map(async (p) => ({
       buffer_m: p.buffer_m ?? 400,
@@ -1382,6 +1403,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     const last = rows[rows.length - 1];
     const totalKm = last ? last.cum_dist / 1000 : 0;
     if (last && totalKm < cfg.maxDistanceKm * 0.95) {
+      progress("Checking for open water at the end of the trace (USGS NHD)…");
       const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
       const accepts = (wb) => acceptsOpenWater(wb, ow);
       let wb = await queryWaterbody(last.lat, last.lon, config);
@@ -1412,6 +1434,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
   return {
     lat, lon, comid, snapName, snapDistM: snapD, snapAlt: snapAlt || null, riverName,
     rows, gd, siteSets, receptorSets, terminalWater, reroutes,
+    nhd_mirror_note: nhdMirrorNote(nhdHits0),
     asOf: cfg.asOf || "live",
     fetchedAt: new Date().toISOString(),
   };
@@ -1814,6 +1837,7 @@ export function computeTrace(data, config = {}) {
     qConfidence = "MODERATE — includes historical-median flow (no live gauge)";
   }
   for (const w of data.corridorWarnings || []) warnings.push(w);
+  if (data.nhd_mirror_note) warnings.push(data.nhd_mirror_note);
   if (qConfidence !== "HIGH") warnings.unshift(`Flow estimate: ${qConfidence} (${qMethod})`);
   {
     const statG = gd.filter((g) => g.q_source === "stat-p50");
@@ -1923,6 +1947,9 @@ export async function resolveTraceMode(lat, lon, config = {}) {
   // hydro.nationalmap.gov answered 504 for hours on 2026-09-23 and every trace click died
   // here before NLDI was even asked. If the probe fails, run the river model (a lake click
   // degrades to a river trace and says so) instead of failing the whole trace.
+  const progress = progressFn(config);
+  const nhdHits0 = nhdState.mirrorHits;
+  progress("Checking whether the spill point is in a lake or estuary (USGS NHD)…");
   let wb;
   try {
     wb = await queryWaterbody(lat, lon, config);
@@ -1930,20 +1957,21 @@ export async function resolveTraceMode(lat, lon, config = {}) {
     return { mode: "river", waterbody: null,
              probe_failed: `NHD waterbody probe unavailable (${String(e && e.message || e).slice(0, 90)}); river mode assumed` };
   }
+  const source_note = nhdMirrorNote(nhdHits0);
   const lakeHit = wb && isOpenWaterBody(wb) && wb.area_sqkm >= ow.minLakeSqKm;
   // v1.10: large FTYPE 460 river-Area polygons are estuaries in practice on
   // the Great Lakes (St. Louis Bay, Duluth) — same tiebreak below guards
   // ordinary big-river clicks (a live reach within riverOverrideM wins)
   const estuaryHit = !lakeHit && wb && isRiverAreaEstuary(wb, ow);
-  if (!lakeHit && !estuaryHit) return { mode: "river" };
+  if (!lakeHit && !estuaryHit) return { mode: "river", source_note };
   const cfg = { ...DEFAULT_CONFIG, ...config };
   try {
     if (await nearRiverReach(lat, lon, cfg.minStreamOrder, ow.riverOverrideM,
                              excludedImpoundments(cfg))) {
-      return { mode: "river", waterbody: wb };
+      return { mode: "river", waterbody: wb, source_note };
     }
   } catch { /* tiebreak unavailable → open water (the PIP hit stands) */ }
-  return { mode: "open-water", waterbody: wb };
+  return { mode: "open-water", waterbody: wb, source_note };
 }
 
 export async function runTrace(lat, lon, config = {}) {
@@ -1953,6 +1981,7 @@ export async function runTrace(lat, lon, config = {}) {
   const data = await fetchTraceData(lat, lon, config);
   const result = computeTrace(data, config);
   if (disp.probe_failed) result.warnings.push(disp.probe_failed);
+  if (disp.source_note && !result.warnings.includes(disp.source_note)) result.warnings.push(disp.source_note);
   if (ow.enabled && ow.continueAtImpoundment && (result.impound_stop_point || result.coastal_stop_point)) {
     try {
       result.open_water = await runOpenWaterContinuation(result, config);
@@ -2053,6 +2082,115 @@ const NHD_WATERBODY_URL =
 // not Waterbody — e.g. Bellingham Bay is only in layer 9 ("Puget Sound")
 const NHD_AREA_URL =
   "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/9/query";
+
+// ---- v1.12.2: National Map NHD access — budget, breaker, NHDPlus MR mirror ----
+//
+// hydro.nationalmap.gov is the only host the engine talks to besides
+// api.water.usgs.gov, and it is the one that fails: the map-service root still
+// answers while its query workers hang (HTTP 000) or 504 for hours (2026-09-23,
+// 2026-10-09, 2026-10-13). Every polygon query used to inherit getJson's
+// 3 x 90 s budget, so a dispatch HINT could cost 4.5 minutes and a river trace
+// makes up to five such probes. Now each National Map call gets NHD_TIMEOUT_MS
+// (one try); on failure the host is marked down for NHD_BREAKER_MS so later
+// probes skip it, and the same query runs against the NHDPlus MR mirror on the
+// USGS geoserver (wmadata:nhdwaterbody / wmadata:nhdarea) — the host NLDI
+// already lives on, so this adds no new point of failure. MR shorelines are
+// coarser (1:100k vs HR) and marine FTYPEs come back as strings (SeaOcean,
+// BayInlet, Estuary); the ftype predicates accept both forms and mirror
+// features are normalized to the HR property names, so every downstream reader
+// is unchanged. Results carry an nhd_mirror_note warning whenever the mirror
+// answered. The primary is still preferred when healthy, so golden and
+// open-water fixtures are unaffected unless the National Map is actually down.
+const NHD_TIMEOUT_MS = 15000;
+const NHD_BREAKER_MS = 5 * 60 * 1000;
+const NHD_LAYER = {
+  waterbody: { url: NHD_WATERBODY_URL, mirror: "wmadata:nhdwaterbody" },
+  area: { url: NHD_AREA_URL, mirror: "wmadata:nhdarea" },
+};
+// HR MapServer FTYPE codes -> NHDPlus MR ftype strings
+const NHD_FTYPE_NAMES = {
+  390: ["LakePond"], 436: ["Reservoir"], 445: ["SeaOcean", "BayInlet"],
+  493: ["Estuary"], 460: ["StreamRiver"],
+};
+const nhdState = { downUntil: 0, lastError: null, mirrorHits: 0 };
+
+/** Breaker / mirror state for diagnostics (widget status, worker logs). */
+export function nhdStatus() {
+  return { breakerOpen: Date.now() < nhdState.downUntil, downUntil: nhdState.downUntil,
+           lastError: nhdState.lastError, mirrorHits: nhdState.mirrorHits };
+}
+/** Make the next National Map call try the primary again (tests, manual retry). */
+export function resetNhdBreaker() { nhdState.downUntil = 0; nhdState.lastError = null; }
+
+/** Warning text when the mirror answered since `sinceHits`, else null. */
+function nhdMirrorNote(sinceHits) {
+  if (nhdState.mirrorHits <= sinceHits) return null;
+  return `USGS National Map NHD unavailable (${nhdState.lastError || "no response"}) — ` +
+    `lake/estuary polygons came from the NHDPlus MR mirror (USGS geoserver): coarser shorelines, ` +
+    `some names may differ. Re-run once USGS recovers if an open-water result matters.`;
+}
+
+/** One NHD polygon query, primary then mirror. q = { pip: [lat, lon] } or
+ *  { env: [lat0, lon0, lat1, lon1] }; ftypes = HR FTYPE codes, or null for all.
+ *  Returns { features, source } with properties normalized to the HR names
+ *  (GNIS_NAME, AREASQKM, FTYPE, PERMANENT_IDENTIFIER) whichever source answered. */
+async function nhdFeatures(layer, q, ftypes = null, progress = () => {}) {
+  const L = NHD_LAYER[layer];
+  if (Date.now() >= nhdState.downUntil) {
+    try {
+      const params = {
+        geometry: q.pip
+          ? `${q.pip[1]},${q.pip[0]}`
+          : JSON.stringify({ xmin: q.env[1], ymin: q.env[0], xmax: q.env[3], ymax: q.env[2],
+                             spatialReference: { wkid: 4326 } }),
+        geometryType: q.pip ? "esriGeometryPoint" : "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        // PERMANENT_IDENTIFIER (v1.11) identifies the polygon for domain de-duping
+        outFields: "GNIS_NAME,AREASQKM,FTYPE,PERMANENT_IDENTIFIER", // UPPERCASE on this layer
+        returnGeometry: "true",
+        maxAllowableOffset: "0.0003",
+        f: "geojson",
+      };
+      if (ftypes && ftypes.length) params.where = `FTYPE IN (${ftypes.join(", ")})`;
+      const j = await getJson(L.url, { params, tries: 1, timeoutMs: NHD_TIMEOUT_MS });
+      // ArcGIS reports query-worker failures as HTTP 200 + {error} — that is an outage too
+      if (j && j.error) throw new Error(`NHD ${j.error.code || ""} ${j.error.message || "query error"}`.trim());
+      return { features: j.features || [], source: "nhd" };
+    } catch (e) {
+      nhdState.downUntil = Date.now() + NHD_BREAKER_MS;
+      const msg = String(e && e.message || e);
+      nhdState.lastError = /AbortError|aborted/i.test(msg)
+        ? `no response within ${NHD_TIMEOUT_MS / 1000} s`
+        : msg.replace(/^https?:\S+ failed after \d+ tries: /, "").slice(0, 100);
+      progress("USGS National Map NHD is not responding — switching to the NHDPlus mirror…");
+    }
+  }
+  const cql = [q.pip
+    ? `INTERSECTS(the_geom, POINT(${q.pip[0]} ${q.pip[1]}))` // lat lon — gotcha 1 axis order
+    : `BBOX(the_geom, ${q.env[0]}, ${q.env[1]}, ${q.env[2]}, ${q.env[3]})`];
+  if (ftypes && ftypes.length) {
+    const names = ftypes.flatMap((c) => NHD_FTYPE_NAMES[c] || []);
+    cql.push(`ftype IN (${names.map((n) => `'${n}'`).join(", ")})`);
+  }
+  const j = await getJson(GEOSERVER, {
+    data: {
+      service: "WFS", version: "2.0.0", request: "GetFeature", typeName: L.mirror,
+      outputFormat: "application/json", cql_filter: cql.join(" AND "),
+      propertyName: "comid,gnis_name,areasqkm,ftype,the_geom",
+    },
+    tries: 2, timeoutMs: 30000,
+  });
+  nhdState.mirrorHits++;
+  const features = (j.features || []).map((f) => {
+    const p = f.properties || {};
+    const name = String(p.gnis_name || "").trim();
+    return { ...f, properties: {
+      GNIS_NAME: name || null, AREASQKM: p.areasqkm ?? null, FTYPE: p.ftype ?? null,
+      PERMANENT_IDENTIFIER: p.comid != null ? `mr:${p.comid}` : null } };
+  });
+  return { features, source: "mirror" };
+}
 const OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast";
 const M_PER_DEG_LAT = 111120.00024; // GNOME Tech Doc §4
 
@@ -2062,11 +2200,11 @@ const M_PER_DEG_LAT = 111120.00024; // GNOME Tech Doc §4
 export function isOpenWaterBody(wb) {
   const f = wb && wb.ftype;
   return f === 390 || f === 436 || f === 493 || f === 445 ||
-    f === "LakePond" || f === "Reservoir" || f === "Estuary" || f === "SeaOcean";
+    f === "LakePond" || f === "Reservoir" || f === "Estuary" || f === "SeaOcean" || f === "BayInlet";
 }
 export function isCoastalBody(wb) {
   const f = wb && wb.ftype;
-  return f === 493 || f === 445 || f === "Estuary" || f === "SeaOcean";
+  return f === 493 || f === 445 || f === "Estuary" || f === "SeaOcean" || f === "BayInlet";
 }
 /** v1.10: large FTYPE 460 "StreamRiver" Area polygons act as estuaries on the
  *  Great Lakes — Duluth's St. Louis Bay estuary has NO Waterbody polygon, only
@@ -2142,24 +2280,11 @@ async function nearRiverReach(lat, lon, minOrder, radiusM, excluded = null) {
  *  gate on ftype/area (isOpenWaterBody / isRiverAreaEstuary), so returning a
  *  460 here cannot flip ordinary river clicks to open water by itself. */
 export async function queryWaterbody(lat, lon, config = {}) {
-  const pipParams = {
-    geometry: `${lon},${lat}`,
-    geometryType: "esriGeometryPoint",
-    inSR: "4326",
-    spatialRel: "esriSpatialRelIntersects",
-    // PERMANENT_IDENTIFIER (v1.11) identifies the polygon for domain de-duping
-    outFields: "GNIS_NAME,AREASQKM,FTYPE,PERMANENT_IDENTIFIER", // UPPERCASE on this layer
-    returnGeometry: "true",
-    maxAllowableOffset: "0.0003",
-    f: "geojson",
-  };
-  const j = await getJson(NHD_WATERBODY_URL, { params: pipParams });
-  let f = j.features && j.features[0];
+  const progress = progressFn(config);
+  let f = (await nhdFeatures("waterbody", { pip: [lat, lon] }, null, progress)).features[0];
   if (!f) {
-    const ja = await getJson(NHD_AREA_URL, {
-      params: { ...pipParams, where: "FTYPE IN (445, 493, 460)" },
-    }).catch(() => null);
-    f = ja && ja.features && ja.features[0];
+    const r = await nhdFeatures("area", { pip: [lat, lon] }, [445, 493, 460], progress).catch(() => null);
+    f = r && r.features[0];
   }
   // marine slivers at river mouths are commonly unnamed in NHD — a coastal
   // ftype without a GNIS name reads better as "tidewater" than "unnamed"
@@ -2203,8 +2328,8 @@ export function nearestOnRings(rings, lat, lon) {
  *  unnetworked delta/mudflats (e.g. the Nooksack at Bellingham Bay). */
 export async function queryCoastalWaterbodyNear(lat, lon, config = {}, radiusDeg = 0.05) {
   let best = null;
-  for (const url of [NHD_WATERBODY_URL, NHD_AREA_URL]) {
-    const cand = await queryCoastalLayerNear(url, lat, lon, radiusDeg).catch(() => null);
+  for (const layer of ["waterbody", "area"]) {
+    const cand = await queryCoastalLayerNear(layer, lat, lon, radiusDeg, [445, 493], config).catch(() => null);
     if (cand && (!best || cand.gap_m < best.gap_m)) best = cand;
     if (best && best.gap_m === 0) break;
   }
@@ -2218,52 +2343,26 @@ export async function queryCoastalWaterbodyNear(lat, lon, config = {}, radiusDeg
  *  can also land in polygon gaps (the Admiralty Inlet class). */
 export async function queryOpenWaterNear(lat, lon, config = {}, radiusDeg = 0.05) {
   let best = null;
-  for (const url of [NHD_WATERBODY_URL, NHD_AREA_URL]) {
-    const cand = await queryCoastalLayerNear(url, lat, lon, radiusDeg,
-      "FTYPE IN (390, 436, 445, 493, 460)").catch(() => null);
+  for (const layer of ["waterbody", "area"]) {
+    const cand = await queryCoastalLayerNear(layer, lat, lon, radiusDeg,
+      [390, 436, 445, 493, 460], config).catch(() => null);
     if (cand && (!best || cand.gap_m < best.gap_m)) best = cand;
     if (best && best.gap_m === 0) break;
   }
   return best;
 }
 
-async function queryCoastalLayerNear(url, lat, lon, radiusDeg, where = "FTYPE IN (445, 493)") {
-  const j = await getJson(url, {
-    params: {
-      geometry: JSON.stringify({
-        xmin: lon - radiusDeg, ymin: lat - radiusDeg,
-        xmax: lon + radiusDeg, ymax: lat + radiusDeg,
-        spatialReference: { wkid: 4326 },
-      }),
-      geometryType: "esriGeometryEnvelope",
-      inSR: "4326",
-      spatialRel: "esriSpatialRelIntersects",
-      where,
-      outFields: "GNIS_NAME,AREASQKM,FTYPE",
-      returnGeometry: "true",
-      maxAllowableOffset: "0.0003",
-      f: "geojson",
-    },
-  });
+async function queryCoastalLayerNear(layer, lat, lon, radiusDeg, ftypes = [445, 493], config = {}) {
+  const { features } = await nhdFeatures(layer,
+    { env: [lat - radiusDeg, lon - radiusDeg, lat + radiusDeg, lon + radiusDeg] }, ftypes, progressFn(config));
   let best = null;
-  for (const f of j.features || []) {
-    const rings = f.geometry.type === "Polygon"
-      ? f.geometry.coordinates
-      : f.geometry.coordinates.flat(1);
-    const near = nearestOnRings(rings, lat, lon);
+  for (const f of features) {
+    const p = parseWaterFeature(f);
+    if (!p) continue;
+    const near = nearestOnRings(p.rings, lat, lon);
     if (!near) continue;
-    const gap = pointInRings(rings, lat, lon) ? 0 : near.dist_m;
-    if (!best || gap < best.gap_m) {
-      const nft = f.properties.FTYPE;
-      best = {
-        name: f.properties.GNIS_NAME ||
-          (nft === 493 || nft === 445 ? "tidewater" : nft === 460 ? "river estuary" : "unnamed waterbody"),
-        area_sqkm: f.properties.AREASQKM ?? null,
-        ftype: f.properties.FTYPE,
-        rings,
-        gap_m: Math.round(gap),
-      };
-    }
+    const gap = pointInRings(p.rings, lat, lon) ? 0 : near.dist_m;
+    if (!best || gap < best.gap_m) best = { ...p, gap_m: Math.round(gap) };
   }
   return best;
 }
@@ -2290,7 +2389,7 @@ function parseWaterFeature(f) {
     : f.geometry.coordinates.flat(1);
   if (!rings.length) return null;
   const ft = f.properties.FTYPE;
-  const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean";
+  const coastalFt = ft === 493 || ft === 445 || ft === "Estuary" || ft === "SeaOcean" || ft === "BayInlet";
   const riverAreaFt = ft === 460 || ft === "StreamRiver";
   return {
     name: f.properties.GNIS_NAME ||
@@ -2314,25 +2413,10 @@ export function ringsBbox(rings) {
 }
 
 /** Every water polygon intersecting an envelope around the point. */
-async function queryWaterPolysIn(url, lat, lon, radiusDeg, where) {
-  const j = await getJson(url, {
-    params: {
-      geometry: JSON.stringify({
-        xmin: lon - radiusDeg, ymin: lat - radiusDeg,
-        xmax: lon + radiusDeg, ymax: lat + radiusDeg,
-        spatialReference: { wkid: 4326 },
-      }),
-      geometryType: "esriGeometryEnvelope",
-      inSR: "4326",
-      spatialRel: "esriSpatialRelIntersects",
-      where,
-      outFields: "GNIS_NAME,AREASQKM,FTYPE,PERMANENT_IDENTIFIER",
-      returnGeometry: "true",
-      maxAllowableOffset: "0.0003",
-      f: "geojson",
-    },
-  });
-  return (j.features || []).map(parseWaterFeature).filter(Boolean);
+async function queryWaterPolysIn(layer, lat, lon, radiusDeg, ftypes, config = {}) {
+  const { features } = await nhdFeatures(layer,
+    { env: [lat - radiusDeg, lon - radiusDeg, lat + radiusDeg, lon + radiusDeg] }, ftypes, progressFn(config));
+  return features.map(parseWaterFeature).filter(Boolean);
 }
 
 /** Build the open-water domain around a run: the polygon the plume starts in
@@ -2344,12 +2428,12 @@ export async function queryWaterDomain(lat, lon, config = {}, primary = null) {
   const key = (p) => p.pid || `${p.name}|${p.ftype}|${p.area_sqkm}`;
   const add = (p) => { if (p && !seen.has(key(p))) seen.set(key(p), p); };
   add(primary);
-  const where = "FTYPE IN (390, 436, 445, 493, 460)";
+  const ftypes = [390, 436, 445, 493, 460];
   // both layers in parallel — these are the two slowest calls in an open-water
   // run (~5 s serial on a 40 km Puget Sound envelope), and they are independent
   const batches = await Promise.all(
-    [NHD_WATERBODY_URL, NHD_AREA_URL].map((url) =>
-      queryWaterPolysIn(url, lat, lon, radiusDeg, where).catch(() => [])),
+    ["waterbody", "area"].map((layer) =>
+      queryWaterPolysIn(layer, lat, lon, radiusDeg, ftypes, config).catch(() => [])),
   );
   for (const batch of batches) {
     for (const p of batch) {
@@ -2928,6 +3012,9 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const ow = { ...DEFAULT_OPENWATER, ...(config.openWater || {}) };
   const log = cfg.verbose ? (...a) => console.log(...a) : null;
+  const progress = progressFn(cfg);
+  const nhdHits0 = nhdState.mirrorHits;
+  if (!waterbody) progress("Checking whether the point is in a lake or estuary (USGS NHD)…");
   let wb = waterbody || (await queryWaterbody(lat, lon, config));
   // v1.10 rescue: impoundment stop points can land in NHD polygon gaps, or in
   // water that only exists as a lake/river-Area polygon nearby — search the
@@ -2949,6 +3036,7 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   }
   // v1.11: the simulation domain is every water polygon near the run, not just
   // the one the click landed in — see queryWaterDomain / markDomainSeams.
+  progress(`Building the open-water domain around ${wb.name} (NHD polygons)…`);
   const domain = await queryWaterDomain(lat, lon, config, wb).catch(() => [wb]);
   const domainRings = [];
   const domainRingOwner = [];
@@ -2990,6 +3078,9 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
   }
   const startTMs = Date.now() + startOffsetHr * 3600000;
   const coastal = isCoastalBody(wb);
+  progress(coastal && ow.coastalCurrents
+    ? "Fetching the wind forecast (Open-Meteo) and tidal currents (NOAA CO-OPS)…"
+    : "Fetching the wind forecast (Open-Meteo)…");
   const windP = fetchWindSeries(lat, lon, startOffsetHr + ow.durationHr);
   // coastal: blended tidal-current field from the nearest prediction stations
   let stationsP = Promise.resolve([]);
@@ -3015,6 +3106,7 @@ export async function fetchOpenWaterData(lat, lon, config = {}, waterbody = null
     siteSets, receptorSets,
     startOffsetHr,
     startTMs,
+    nhd_mirror_note: nhdMirrorNote(nhdHits0),
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -3219,6 +3311,7 @@ export function computeOpenWater(data, config = {}) {
   warnings.push(
     "Open-water model: surface transport only (GNOME-class physics) — no weathering; ETAs depend on the wind forecast" +
     (currentAt ? " and predicted tidal currents." : "; lake-circulation currents are not modeled."));
+  if (data.nhd_mirror_note) warnings.push(data.nhd_mirror_note);
   const wbFt = data.waterbody.ftype;
   if (wbFt === 460 || wbFt === "StreamRiver") {
     warnings.push(
