@@ -20,6 +20,9 @@
  *   6. snap click to streamorde >= minStreamOrder
  *   7. National Map NHD polygons: 15 s budget + 5-min breaker + NHDPlus MR
  *      mirror on the USGS geoserver (v1.12.2) — see nhdFeatures()
+ *   8. NLDI gauge lookup (nwissite) on its own budget; if it fails the trace
+ *      continues WITHOUT live gauges (EROM monthly modeled flow) and says so
+ *      in the warnings (v1.12.3, 2026-10-23 USGS NLDI outage hung every trace)
  *
  * Corridor mode (v1.6): US federal services (NLDI/NHDPlus/NWIS) end at the
  * border. config.corridors lists precomputed corridor files (see
@@ -32,7 +35,7 @@
  * with the US path.
  */
 
-export const ENGINE_VERSION = "1.12.2";
+export const ENGINE_VERSION = "1.12.3";
 
 const NLDI_BASE = "https://api.water.usgs.gov/nldi";
 const GEOSERVER = "https://api.water.usgs.gov/geoserver/wmadata/ows";
@@ -130,6 +133,7 @@ export const DEFAULT_CONFIG = {
   siteProviders: [],
   receptorProviders: [],
   upstreamGaugeKm: 30,        // search UM this far for an upstream anchor gauge; 0 = off
+  gaugeLookupTimeoutMs: 25000, // v1.12.3: per-try budget for the NLDI gauge lookup (2 tries)
   qInterp: "drainage-area",   // 'drainage-area' (Q jumps at confluences) | 'distance' (legacy linear smear)
   gaugeStatFallback: true,    // gauge IV feed down -> period-of-record median daily flow (Payton's get_discharge pattern)
   impoundStopKm: 2.0,
@@ -405,9 +409,9 @@ async function nldiDmFlowlines(comid, distanceKm) {
   return geoms;
 }
 
-async function nldiGauges(comid, distanceKm, mode) {
+async function nldiGauges(comid, distanceKm, mode, { timeoutMs = 90000, tries = 3 } = {}) {
   const j = await getJson(`${NLDI_BASE}/linked-data/comid/${comid}/navigation/${mode}/nwissite`, {
-    params: { distance: String(Math.trunc(distanceKm)) },
+    params: { distance: String(Math.trunc(distanceKm)) }, timeoutMs, tries,
   });
   const out = [];
   for (const f of j.features || []) {
@@ -1312,14 +1316,25 @@ export async function fetchTraceData(lat, lon, config = {}) {
 
   // 3. discharge inputs: NLDI downstream gauges -> NWIS Q (+DA), located on trace
   progress("Finding downstream gauges (USGS NLDI)…");
-  const gauges = await nldiGauges(comid, cfg.maxDistanceKm, "DM");
+  // v1.12.3: the gauge lookup is not a dependency. When NLDI's nwissite endpoint
+  // is down/slow the trace continues with no live gauges -> the EROM monthly
+  // modeled-flow path below, with a warning, instead of failing the whole trace.
+  let gauges = [], gaugeNote = null;
+  const gaugeBudget = { timeoutMs: cfg.gaugeLookupTimeoutMs || 25000, tries: 2 };
+  try {
+    gauges = await nldiGauges(comid, cfg.maxDistanceKm, "DM", gaugeBudget);
+  } catch (e) {
+    gaugeNote = "Live USGS gauge lookup unavailable (NLDI not responding) — flow is MODELED " +
+      "(EROM monthly / drainage area), not from live gauges. Re-run when USGS recovers for a gauge-based trace.";
+    log(`  DM gauge lookup failed (${String(e).slice(0, 100)}) — continuing WITHOUT live gauges`);
+  }
   // upstream-anchor candidates: nearest UM gauges (fixes the discontinuity when
   // the click is just below a gauge and DM navigation no longer sees it)
   let upCands = [];
-  if (cfg.upstreamGaugeKm > 0) {
+  if (cfg.upstreamGaugeKm > 0 && !gaugeNote) {   // same service: skip it when DM just failed
     try {
       const dmIds = new Set(gauges.map((g) => g.station_id));
-      upCands = (await nldiGauges(comid, cfg.upstreamGaugeKm, "UM"))
+      upCands = (await nldiGauges(comid, cfg.upstreamGaugeKm, "UM", gaugeBudget))
         .filter((u) => !dmIds.has(u.station_id))
         .map((u) => ({ ...u, upstream_m: haversineM(lat, lon, u.lat, u.lon) }))
         .filter((u) => u.upstream_m <= cfg.upstreamGaugeKm * 1000)
@@ -1435,6 +1450,7 @@ export async function fetchTraceData(lat, lon, config = {}) {
     lat, lon, comid, snapName, snapDistM: snapD, snapAlt: snapAlt || null, riverName,
     rows, gd, siteSets, receptorSets, terminalWater, reroutes,
     nhd_mirror_note: nhdMirrorNote(nhdHits0),
+    gauge_note: gaugeNote,
     asOf: cfg.asOf || "live",
     fetchedAt: new Date().toISOString(),
   };
@@ -1839,6 +1855,7 @@ export function computeTrace(data, config = {}) {
   for (const w of data.corridorWarnings || []) warnings.push(w);
   if (data.nhd_mirror_note) warnings.push(data.nhd_mirror_note);
   if (qConfidence !== "HIGH") warnings.unshift(`Flow estimate: ${qConfidence} (${qMethod})`);
+  if (data.gauge_note) warnings.unshift(data.gauge_note);
   {
     const statG = gd.filter((g) => g.q_source === "stat-p50");
     if (statG.length) {
