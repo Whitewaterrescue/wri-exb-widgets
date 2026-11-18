@@ -146,5 +146,6 @@
     "anchorSpacingFt": 100,
     "reservePct": 20
   },
-  "timingModel": "jobson"
+  "timingModel": "jobson",
+  "simple": true
 }

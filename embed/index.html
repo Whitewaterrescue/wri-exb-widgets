@@ -29,6 +29,12 @@
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 5px; margin-right: 4px; }
   .dim { color: #999; }
   #legendNote { color: #777; margin-top: 4px; font-size: 11px; }
+  /* simple mode (config "simple": true, e.g. the public StoryMap embed): one click on the map -> trace + GRP ETAs */
+  body.simple #armBtn, body.simple #recordBtn, body.simple #hideBtn, body.simple #sfLabel,
+  body.simple #diag, body.simple #warnings, body.simple #legendNote, body.simple tfoot { display: none !important; }
+  body.simple #results th:nth-child(n+3), body.simple #results td:nth-child(n+3) { display: none; }
+  body.simple #status { font-weight: 600; }
+  body.simple #viewDiv { cursor: crosshair; }
   @media (max-width: 700px) {
     #app { flex-direction: column; }
     #panel { width: auto; height: 45%; border-left: none; border-top: 1px solid #ddd; }
@@ -45,7 +51,7 @@
       <button id="clearBtn">Clear</button>
       <button id="recordBtn" disabled title="Copy run provenance record (JSON) for after-action documentation">⎘ Record</button>
       <button id="hideBtn" disabled title="Hide/show the trajectory on the map without losing the run (briefings)">👁 Hide</button>
-      <label style="margin-left:auto" title="Safety factor — changing it re-runs instantly from cached hydrology">
+      <label id="sfLabel" style="margin-left:auto" title="Safety factor — changing it re-runs instantly from cached hydrology">
         SF <select id="sfSel">
           <option value="1.0">1.0</option><option value="1.25">1.25</option>
           <option value="1.5" selected>1.5</option><option value="2.0">2.0</option>
@@ -80,6 +86,10 @@
   if (params.get("webmap")) CFG.webmap = params.get("webmap");
   if (params.get("asOf")) CFG.asOf = params.get("asOf"); // replay: pin historical flows
   if (CFG.title) { $("title").textContent = CFG.title; document.title = CFG.title; }
+  const SIMPLE = CFG.simple === true || params.get("simple") === "1";
+  if (SIMPLE) document.body.classList.add("simple");
+  const READY_MSG = SIMPLE ? "Click a river on the map to trace a spill downstream for 24 hours."
+                           : 'Click "Set spill point", then click the water (river, lake, or reservoir).';
   $("sfSel").value = String(parseFloat(params.get("sf")) || CFG.safetyFactor || 1.5);
 
   const APP_ID = params.get("appid") || "ZTWroggX3c8hdiJo"; // WRI Web Deliverables (GitHub Pages)
@@ -110,7 +120,9 @@
     view.when(() => {
       map.add(gfx);
       $("armBtn").disabled = false;
-      $("status").textContent = 'Click "Set spill point", then click the water (river, lake, or reservoir).';
+      $("status").textContent = READY_MSG;
+      // simple mode: every map click runs a trace (no arm button)
+      if (SIMPLE) view.on("click", (evt) => { if (!running) runAt(evt.mapPoint.latitude, evt.mapPoint.longitude); });
     });
 
     // ---- ETA color bands ----
@@ -441,20 +453,23 @@
         w.style.display = "block";
         w.innerHTML = res.warnings.map((x) => `<div>&#9888; ${x}</div>`).join("");
       } else { w.style.display = "none"; }
-      $("note").textContent = sites.length
+      $("note").textContent = SIMPLE
+        ? (sites.length ? "Response sites in the oil's path, with estimated arrival times. Click anywhere else to run it again." : "")
+        : sites.length
         ? `ETAs are estimates (±20%), safety factor ×${res.safety_factor} applied — treat as bands, not appointments. ` +
           (res.gauges_used.length ? `Flows: ${res.gauges_used.map((g) => g.station_id).join(", ")}.` : "No live gauges — drainage-area flow estimate.")
         : "";
       if (!sites.length) {
-        $("results").innerHTML = '<div class="dim">No configured sites within reach of this trace.</div>';
+        $("results").innerHTML = SIMPLE ? '<div class="dim">No mapped response sites on this stretch of river. Try a river in western Montana.</div>'
+                                        : '<div class="dim">No configured sites within reach of this trace.</div>';
         $("legendNote").textContent = "";
         return;
       }
       const fmtEta = (h) => (h < 1 ? `${Math.round(h * 60)} min` : `${h.toFixed(1)} hr`);
-      const fmtEtaCell = (s) => s.eta_early_hr !== undefined
+      const fmtEtaCell = (s) => (SIMPLE && s.eta_hr < 0.05) ? "At the spill" : s.eta_early_hr !== undefined
         ? `<span title="earliest credible ${s.eta_early_hr} hr · first arrival ${s.eta_hr} hr · peak ${s.eta_peak_hr} hr${s.clear_hr ? ` · clear ~${s.clear_hr} hr` : ""}">${s.eta_early_hr.toFixed(1)}–${s.eta_hr.toFixed(1)} hr</span>`
         : fmtEta(s.eta_hr);
-      let html = "<table><thead><tr><th>ETA</th><th>Site</th><th>km</th><th>Boom</th></tr></thead><tbody>";
+      let html = "<table><thead><tr><th>ETA</th><th>" + (SIMPLE ? "Response site" : "Site") + "</th><th>km</th><th>Boom</th></tr></thead><tbody>";
       let totFt = 0, totAn = 0, nBoom = 0;
       for (const s of sites) {
         let boomCell = "—";
@@ -510,8 +525,9 @@
       $("hideBtn").textContent = "👁 Hide";
       $("diag").innerHTML = cache.fetchNotes.concat([`${res.sites.length} site(s) within buffer of the trace.`])
         .map((d) => `<div>${d}</div>`).join("");
-      $("status").textContent =
-        `${res.river_name || "Trace"} — ${res.distance_km_24h.toFixed(1)} km in ≤ ${CFG.maxHours ?? 24} h` +
+      $("status").textContent = SIMPLE
+        ? `${res.river_name || "This river"}: the leading edge travels about ${Math.round(res.distance_km_24h / 1.609)} miles (${res.distance_km_24h.toFixed(0)} km) in ${CFG.maxHours ?? 24} hours.`
+        : `${res.river_name || "Trace"} — ${res.distance_km_24h.toFixed(1)} km in ≤ ${CFG.maxHours ?? 24} h` +
         (fromCache ? " · recomputed instantly from cached hydrology" : "");
       // reservoir continuation (async — river result is already on screen)
       if ((res.impound_stop_point || res.coastal_stop_point) && (CFG.openWater?.continueAtImpoundment ?? true)) {
@@ -526,7 +542,7 @@
         }).catch((e) => {
           if (lastResult !== res) return;
           $("status").textContent = $("status").textContent.replace(/ · modeling .*$/,
-            ` · continuation unavailable (${String(e).slice(0, 60)})`);
+            SIMPLE ? "" : ` · continuation unavailable (${String(e).slice(0, 60)})`);
         });
       }
     }
@@ -624,7 +640,7 @@
       owContCache = null;
       $("results").innerHTML = ""; $("warnings").style.display = "none";
       $("note").textContent = ""; $("diag").innerHTML = ""; $("legendNote").textContent = "";
-      $("status").textContent = 'Cleared. Click "Set spill point" to run again.';
+      $("status").textContent = SIMPLE ? READY_MSG : 'Cleared. Click "Set spill point" to run again.';
     };
 
     $("sfSel").onchange = () => {
