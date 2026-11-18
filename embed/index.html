@@ -387,7 +387,7 @@
         html += "<table style='margin-top:6px'><thead><tr><th>ETA</th><th>Site</th></tr></thead><tbody>";
         for (const s of ow.sites) {
           html += `<tr><td><span class="dot" style="background:${bandColor(s.eta_hr)}"></span>${s.eta_hr.toFixed(1)} hr</td>` +
-            `<td class="sitecol">${s.name ?? ""}</td></tr>`;
+            `<td class="sitecol">${s.name ?? ""}${s.plan ? `<div class="dim" style="font-size:11px">${s.plan}</div>` : ""}</td></tr>`;
         }
         html += "</tbody></table>";
       }
@@ -412,18 +412,36 @@
     let owContCache = null; // { key, data }
     const owConfig = () => Object.assign({ verbose: false },
       { openWater: CFG.openWater || {} });
+    // site service for open-water runs: send the best-guess plume outline for each hour; sites come back
+    // pinned to an outline vertex (index into the flattened vertex list), never with their own coordinates
+    async function owProxySites(owData, startHr) {
+      try {
+        const pre = engine.computeOpenWater(startHr != null ? engine.rebaseOpenWaterData(owData, startHr) : owData, owConfig());
+        const hulls = (pre.hourly || []).map((h) => h.hull).filter((r) => r && r.length >= 3);
+        if (!hulls.length) return;
+        const flat = []; hulls.forEach((r) => r.forEach((p) => flat.push(p)));   // [lon, lat]
+        let ans = null;
+        for (let attempt = 0; attempt < 2 && !(ans && ans.ok); attempt++) {
+          const r = await fetch(CFG.siteProxy, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ hulls }) });
+          ans = await r.json().catch(() => null);
+        }
+        if (ans && ans.ok) owData.siteSets = [{ buffer_m: 500, feats: ans.sites.map((x) => ({ name: x.name, plan: x.plan, lat: flat[x.i][1], lon: flat[x.i][0] })) }];
+      } catch (e) { /* the drift still shows without sites */ }
+    }
+
     async function continuationFor(res) {
       const sp = res.impound_stop_point || res.coastal_stop_point;
       const key = `${sp.lat.toFixed(4)},${sp.lon.toFixed(4)}`;
       if (!owContCache || owContCache.key !== key) {
         // reuse the river run's already-fetched site features (no second layer query)
-        const cachedProviders = (cache.data.siteSets || []).map((s) => ({
+        const cachedProviders = CFG.siteProxy ? [] : (cache.data.siteSets || []).map((s) => ({
           name: s.name, buffer_m: s.buffer_m, fetch: async () => s.feats,
         }));
         const data = await engine.fetchOpenWaterData(
           sp.lat, sp.lon,
           Object.assign(owConfig(), { siteProviders: cachedProviders }),
           res.terminal_waterbody || null, sp.eta_hr);
+        if (CFG.siteProxy) await owProxySites(data, sp.eta_hr);
         owContCache = { key, data };
       }
       const ow = engine.computeOpenWater(
@@ -483,7 +501,7 @@
             ` <span class="dim">${s.boom.source === "drawn" ? "&#10003;" : "est."}</span></span>`;
         }
         html += `<tr><td><span class="dot" style="background:${bandColor(s.eta_hr)}"></span>${fmtEtaCell(s)}</td>` +
-                `<td class="sitecol">${s.name ?? ""}</td><td>${s.dist_km.toFixed(1)}</td><td>${boomCell}</td></tr>`;
+                `<td class="sitecol">${s.name ?? ""}${s.plan ? `<div class="dim" style="font-size:11px">${s.plan}</div>` : ""}</td><td>${s.dist_km.toFixed(1)}</td><td>${boomCell}</td></tr>`;
       }
       html += "</tbody>";
       if (nBoom) {
@@ -563,8 +581,9 @@
           if (disp.mode === "open-water") {
             $("status").textContent = `Open water (${disp.waterbody.name}) — running wind-drift particle model…`;
             const owData = await engine.fetchOpenWaterData(lat, lon, Object.assign(owConfig(), {
-              siteProviders: siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
+              siteProviders: CFG.siteProxy ? [] : siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
             }), disp.waterbody);
+            if (CFG.siteProxy) { $("status").textContent = "Checking response plans around the drift…"; await owProxySites(owData); }
             const res = engine.computeOpenWater(owData, owConfig());
             cache = { lat, lon, mode: "open-water", owData, fetchNotes: notes.slice() };
             drawOpenWater(res);
@@ -583,9 +602,32 @@
           }
           const data = await engine.fetchTraceData(lat, lon, Object.assign(modelCfg(parseFloat($("sfSel").value)), {
             widthProvider: makeWidthProvider(),
-            siteProviders: siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
+            siteProviders: CFG.siteProxy ? [] : siteLayers.map((lc, i) => makeSiteProvider(lc, 500, `Site layer ${i + 1}`, notes)),
             receptorProviders: (CFG.receptorLayers || []).map((lc, i) => makeSiteProvider(lc, 800, `Receptor layer ${i + 1}`, notes)),
           }));
+          // site service (config siteProxy): the GRP layers stay private. Send this trace's line; the
+          // service answers site NAMES + the index of the nearest point on OUR line (no site coordinates),
+          // which become ordinary site features for the engine's own proximity/ETA step.
+          if (CFG.siteProxy) {
+            $("status").textContent = "Checking response plans along the trace…";
+            try {
+              const pre = engine.computeTrace(data, modelCfg(parseFloat($("sfSel").value)));
+              const tr = pre.trace || [];
+              const step = Math.max(1, Math.ceil(tr.length / 3500));
+              const line = [];
+              for (let k = 0; k < tr.length; k += step) line.push([+tr[k].lat.toFixed(6), +tr[k].lon.toFixed(6)]);
+              if (tr.length > 1 && (tr.length - 1) % step) line.push([+tr[tr.length - 1].lat.toFixed(6), +tr[tr.length - 1].lon.toFixed(6)]);
+              let ans = null;
+              for (let attempt = 0; attempt < 2 && !(ans && ans.ok); attempt++) {
+                const r = await fetch(CFG.siteProxy, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ line }) });
+                ans = await r.json().catch(() => null);
+              }
+              if (ans && ans.ok) {
+                data.siteSets = [{ buffer_m: 500, feats: ans.sites.map((s) => ({ name: s.name, plan: s.plan, lat: line[s.i][0], lon: line[s.i][1] })) }];
+                if (ans.capped) notes.push("Showing the first 30 sites along the trace.");
+              } else notes.push("Response-plan site check unavailable" + (ans && ans.error ? ` (${ans.error})` : ""));
+            } catch (e) { notes.push("Response-plan site check unavailable"); }
+          }
           const drawn = new Map();
           const seen = new Set();
           const boomCfgs = siteLayers.filter((lc) => lc.boomLayer && lc.boomLayer.url).map((lc) => lc.boomLayer);
